@@ -118,6 +118,9 @@ const API_PERF_BODY_MB_THRESHOLD_ENV_KEY = 'CODEXUI_API_PERF_BODY_MB_THRESHOLD'
 const DEFAULT_API_PERF_MS_THRESHOLD = 300
 const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
+const LIVE_STATE_CACHE_TTL_MS = 30_000
+const MAX_LIVE_STATE_SESSION_LOG_BYTES = 8 * 1024 * 1024
+const MAX_THREAD_SNAPSHOT_SESSION_BYTES = 8 * 1024 * 1024
 
 type SessionRecoveredFileChange = {
   path: string
@@ -2523,7 +2526,8 @@ class AppServerProcess {
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
-  private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
+  private readonly liveStateCache = new Map<string, { data: unknown; expiresAt: number }>()
+  private readonly inFlightLiveStateByThreadId = new Map<string, Promise<unknown>>()
 
 
   private getCodexCommand(): string {
@@ -2711,23 +2715,48 @@ class AppServerProcess {
     this.lastThreadReadSnapshotByThreadId.set(threadId, snapshot)
   }
 
+  clearThreadReadSnapshot(threadId: string): void {
+    this.lastThreadReadSnapshotByThreadId.delete(threadId)
+  }
+
   getLastThreadReadSnapshot(threadId: string): unknown | null {
     return this.lastThreadReadSnapshotByThreadId.get(threadId) ?? null
   }
 
-  cacheLiveState(threadId: string, data: unknown, turnCount: number, sessionSize: number): void {
-    this.liveStateCache.set(threadId, { data, turnCount, sessionSize })
+  cacheLiveState(threadId: string, data: unknown): void {
+    this.liveStateCache.set(threadId, {
+      data,
+      expiresAt: Date.now() + LIVE_STATE_CACHE_TTL_MS,
+    })
   }
 
-  getCachedLiveState(threadId: string, turnCount: number, sessionSize: number): unknown | null {
+  getCachedLiveState(threadId: string): unknown | null {
     const cached = this.liveStateCache.get(threadId)
     if (!cached) return null
-    if (cached.turnCount !== turnCount || cached.sessionSize !== sessionSize) return null
+    if (cached.expiresAt <= Date.now()) {
+      this.liveStateCache.delete(threadId)
+      return null
+    }
     return cached.data
   }
 
   invalidateLiveStateCache(threadId: string): void {
     this.liveStateCache.delete(threadId)
+  }
+
+  getInFlightLiveState(threadId: string): Promise<unknown> | null {
+    return this.inFlightLiveStateByThreadId.get(threadId) ?? null
+  }
+
+  setInFlightLiveState(threadId: string, promise: Promise<unknown>): void {
+    this.inFlightLiveStateByThreadId.set(threadId, promise)
+  }
+
+  clearInFlightLiveState(threadId: string, promise: Promise<unknown>): void {
+    const current = this.inFlightLiveStateByThreadId.get(threadId)
+    if (current === promise) {
+      this.inFlightLiveStateByThreadId.delete(threadId)
+    }
   }
 
   private captureItemFromNotification(notification: { method: string; params: unknown }): void {
@@ -3719,62 +3748,82 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           return
         }
 
+        const cached = appServer.getCachedLiveState(threadId)
+        if (cached) {
+          setJson(res, 200, cached)
+          return
+        }
+
+        const inFlight = appServer.getInFlightLiveState(threadId)
+        if (inFlight) {
+          setJson(res, 200, await inFlight)
+          return
+        }
+
         try {
-          const threadReadResult = await appServer.rpc('thread/read', {
-            threadId,
-            includeTurns: true,
-          })
-          const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
-          appServer.storeThreadReadSnapshot(threadId, sanitized)
+          const liveStatePromise = (async () => {
+            const threadReadResult = await appServer.rpc('thread/read', {
+              threadId,
+              includeTurns: true,
+            })
+            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
 
-          const record = asRecord(sanitized)
-          const thread = asRecord(record?.thread)
-          const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
+            const record = asRecord(sanitized)
+            const thread = asRecord(record?.thread)
+            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
-          const sessionPath = readNonEmptyString(thread?.path)
-          let sessionSize = 0
-          if (sessionPath && isAbsolute(sessionPath)) {
-            try {
-              const s = await stat(sessionPath)
-              sessionSize = s.size
-            } catch { /* missing */ }
-          }
-
-          const cached = appServer.getCachedLiveState(threadId, rawTurns.length, sessionSize)
-          if (cached) {
-            setJson(res, 200, cached)
-            return
-          }
-
-          let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
-
-          if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0) {
-            try {
-              const sessionLogRaw = await readFile(sessionPath, 'utf8')
-              turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
-            } catch {
-              // Session log not available — continue without command recovery
+            const sessionPath = readNonEmptyString(thread?.path)
+            let sessionSize = 0
+            if (sessionPath && isAbsolute(sessionPath)) {
+              try {
+                const s = await stat(sessionPath)
+                sessionSize = s.size
+              } catch { /* missing */ }
             }
+
+            if (sessionSize > 0 && sessionSize <= MAX_THREAD_SNAPSHOT_SESSION_BYTES) {
+              appServer.storeThreadReadSnapshot(threadId, sanitized)
+            } else {
+              appServer.clearThreadReadSnapshot(threadId)
+            }
+
+            let turns = appServer.mergeItemsIntoTurns(threadId, rawTurns)
+
+            if (sessionPath && isAbsolute(sessionPath) && sessionSize > 0 && sessionSize <= MAX_LIVE_STATE_SESSION_LOG_BYTES) {
+              try {
+                const sessionLogRaw = await readFile(sessionPath, 'utf8')
+                turns = mergeSessionCommandsIntoTurns(turns, sessionLogRaw)
+              } catch {
+                // Session log not available — continue without command recovery
+              }
+            }
+
+            const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
+            const isInProgress = lastTurn?.status === 'inProgress'
+
+            const responseData = {
+              threadId,
+              conversationState: {
+                turns,
+              },
+              ownerClientId: null,
+              liveStateError: null,
+              isInProgress,
+            }
+
+            if (!isInProgress) {
+              appServer.cacheLiveState(threadId, responseData)
+            }
+
+            return responseData
+          })()
+
+          appServer.setInFlightLiveState(threadId, liveStatePromise)
+          try {
+            setJson(res, 200, await liveStatePromise)
+          } finally {
+            appServer.clearInFlightLiveState(threadId, liveStatePromise)
           }
-
-          const lastTurn = turns.length > 0 ? asRecord(turns[turns.length - 1]) : null
-          const isInProgress = lastTurn?.status === 'inProgress'
-
-          const responseData = {
-            threadId,
-            conversationState: {
-              turns,
-            },
-            ownerClientId: null,
-            liveStateError: null,
-            isInProgress,
-          }
-
-          if (!isInProgress) {
-            appServer.cacheLiveState(threadId, responseData, rawTurns.length, sessionSize)
-          }
-
-          setJson(res, 200, responseData)
         } catch (error) {
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (snapshot) {

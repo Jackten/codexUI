@@ -175,6 +175,33 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - Reset appearance to the previous user preference.
 
+### Feature: Large-thread live-state stabilization
+
+#### Prerequisites
+- App is running from this repository on an isolated test port (not the live systemd instance).
+- A large historical Codex thread exists with a very large session log (for example, a thread backed by a session file hundreds of MB in size).
+- One browser session can open the large thread route directly.
+- Optional: shell access to inspect the app process tree memory while requests run.
+
+#### Steps
+1. Start the app from this repository on a separate port, for example `16001`.
+2. Open the large thread in the browser.
+3. Observe the first thread load timing.
+4. Trigger the same `/codex-api/thread-live-state` request again for that same thread two or three times in succession.
+5. Trigger three parallel `/codex-api/thread-live-state` requests for the same large thread after the completed-thread cache expires.
+6. Observe memory after the requests settle.
+
+#### Expected Results
+- The first cold load may still be expensive, but repeated requests for the same completed large thread should become fast.
+- Parallel requests for the same large thread should collapse into one shared expensive read rather than stacking linearly.
+- Memory should fall back down after the request burst instead of leaving the app permanently inflated.
+- The thread should still render core conversation content even when expensive session-log enrichment is skipped for oversized session files.
+
+#### Rollback/Cleanup
+- Stop the isolated test instance.
+- Close the test browser tab.
+- If needed, wait for the process to drop back to baseline memory before further tests.
+
 ### Feature: Dark theme for worktree runtime selector and Skills Hub
 
 #### Prerequisites
