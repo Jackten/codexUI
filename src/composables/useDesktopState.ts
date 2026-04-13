@@ -1035,6 +1035,7 @@ export function useDesktopState() {
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
+  const inFlightLoadMessagesByThreadId = new Map<string, Promise<void>>()
   let rateLimitRefreshPromise: Promise<void> | null = null
   let pendingThreadsRefresh = false
   const pendingThreadMessageRefresh = new Set<string>()
@@ -3383,71 +3384,88 @@ export function useDesktopState() {
       return
     }
 
+    const existingLoad = inFlightLoadMessagesByThreadId.get(threadId)
+    if (existingLoad) {
+      await existingLoad
+      return
+    }
+
     const alreadyLoaded = loadedMessagesByThreadId.value[threadId] === true
     const shouldShowLoading = options.silent !== true && !alreadyLoaded
     if (shouldShowLoading) {
       isLoadingMessages.value = true
     }
 
-    try {
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const resumePromise = needsResume ? resumeThread(threadId) : null
-      const detailPromise = getThreadDetail(threadId)
+    const loadPromise = (async () => {
+      try {
+        const needsResume = resumedThreadById.value[threadId] !== true
+        const resumePromise = needsResume ? resumeThread(threadId) : null
+        const detailPromise = getThreadDetail(threadId)
 
-      const [resumedThread, detail] = await Promise.all([resumePromise, detailPromise])
+        const [resumedThread, detail] = await Promise.all([resumePromise, detailPromise])
 
-      if (resumedThread) {
-        setThreadModelId(threadId, resumedThread.model)
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
+        if (resumedThread) {
+          setThreadModelId(threadId, resumedThread.model)
+          resumedThreadById.value = {
+            ...resumedThreadById.value,
+            [threadId]: true,
+          }
+        }
+
+        const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+        markThreadMessagesPersisted(threadId, nextMessages)
+        replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
+        rebindLiveFileChangeTurnIndices(threadId)
+        const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+        const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
+          preserveMissing: options.silent === true,
+        })
+        setPersistedMessagesForThread(threadId, mergedMessages)
+
+        const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
+        const nextLiveAgent = removeRedundantLiveAgentMessages(previousLiveAgent, nextMessages)
+        setLiveAgentMessagesForThread(threadId, nextLiveAgent)
+        removeLiveCommandsPersistedIn(threadId, nextMessages)
+        removeLiveFileChangesPersistedIn(threadId, nextMessages)
+
+        loadedMessagesByThreadId.value = {
+          ...loadedMessagesByThreadId.value,
           [threadId]: true,
         }
-      }
 
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
-      markThreadMessagesPersisted(threadId, nextMessages)
-      replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
-      rebindLiveFileChangeTurnIndices(threadId)
-      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        preserveMissing: options.silent === true,
-      })
-      setPersistedMessagesForThread(threadId, mergedMessages)
-
-      const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
-      const nextLiveAgent = removeRedundantLiveAgentMessages(previousLiveAgent, nextMessages)
-      setLiveAgentMessagesForThread(threadId, nextLiveAgent)
-      removeLiveCommandsPersistedIn(threadId, nextMessages)
-      removeLiveFileChangesPersistedIn(threadId, nextMessages)
-
-      loadedMessagesByThreadId.value = {
-        ...loadedMessagesByThreadId.value,
-        [threadId]: true,
-      }
-
-      const version = currentThreadVersion(threadId)
-      if (version) {
-        loadedVersionByThreadId.value = {
-          ...loadedVersionByThreadId.value,
-          [threadId]: version,
+        const version = currentThreadVersion(threadId)
+        if (version) {
+          loadedVersionByThreadId.value = {
+            ...loadedVersionByThreadId.value,
+            [threadId]: version,
+          }
+        }
+        setThreadInProgress(threadId, inProgress)
+        if (activeTurnId) {
+          activeTurnIdByThreadId.value = {
+            ...activeTurnIdByThreadId.value,
+            [threadId]: activeTurnId,
+          }
+        } else if (activeTurnIdByThreadId.value[threadId]) {
+          activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
+        }
+        if (!inProgress) {
+          clearCompletedTurnLiveState(threadId)
+        }
+        markThreadAsRead(threadId)
+      } finally {
+        if (shouldShowLoading) {
+          isLoadingMessages.value = false
         }
       }
-      setThreadInProgress(threadId, inProgress)
-      if (activeTurnId) {
-        activeTurnIdByThreadId.value = {
-          ...activeTurnIdByThreadId.value,
-          [threadId]: activeTurnId,
-        }
-      } else if (activeTurnIdByThreadId.value[threadId]) {
-        activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
-      }
-      if (!inProgress) {
-        clearCompletedTurnLiveState(threadId)
-      }
-      markThreadAsRead(threadId)
+    })()
+
+    inFlightLoadMessagesByThreadId.set(threadId, loadPromise)
+    try {
+      await loadPromise
     } finally {
-      if (shouldShowLoading) {
-        isLoadingMessages.value = false
+      if (inFlightLoadMessagesByThreadId.get(threadId) === loadPromise) {
+        inFlightLoadMessagesByThreadId.delete(threadId)
       }
     }
   }
