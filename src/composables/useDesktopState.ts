@@ -3728,86 +3728,84 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
-      const version = currentThreadVersion(threadId)
-      const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
-      const loadedRecently =
-        Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
-      const canReuseLoadedMessages =
-        alreadyLoaded &&
-        (
-          loadedRecently ||
+        const version = currentThreadVersion(threadId)
+        const loadedVersion = loadedVersionByThreadId.value[threadId] ?? ''
+        const loadedRecently =
+          Date.now() - (lastMessageLoadAtByThreadId.get(threadId) ?? 0) < RECENT_THREAD_MESSAGE_LOAD_REUSE_MS
+        const canReuseLoadedMessages =
+          alreadyLoaded &&
           (
-            (version.length === 0 || loadedVersion === version) &&
-            inProgressById.value[threadId] !== true
+            loadedRecently ||
+            (
+              (version.length === 0 || loadedVersion === version) &&
+              inProgressById.value[threadId] !== true
+            )
           )
-        )
 
-      if (canReuseLoadedMessages) {
-        markThreadAsRead(threadId)
-        return
-      }
-
-      const needsResume = resumedThreadById.value[threadId] !== true
-      const resumedThread = needsResume ? await resumeThread(threadId) : null
-      const detail = resumedThread ?? await getThreadDetail(threadId)
-
-      if (resumedThread) {
-        setThreadModelId(threadId, resumedThread.model)
-        resumedThreadById.value = {
-          ...resumedThreadById.value,
-          [threadId]: true,
+        if (canReuseLoadedMessages) {
+          markThreadAsRead(threadId)
+          return
         }
-      }
 
-      const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
-      markThreadMessagesPersisted(threadId, nextMessages)
-      replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
-      rebindLiveFileChangeTurnIndices(threadId)
-      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
-      const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
-        preserveMissing: options.silent === true,
-      })
-      setPersistedMessagesForThread(threadId, mergedMessages)
+        const needsResume = resumedThreadById.value[threadId] !== true
+        const resumedThread = needsResume ? await resumeThread(threadId) : null
+        const detail = resumedThread ?? await getThreadDetail(threadId)
 
-      const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
-      if (inProgress) {
+        if (resumedThread) {
+          setThreadModelId(threadId, resumedThread.model)
+          resumedThreadById.value = {
+            ...resumedThreadById.value,
+            [threadId]: true,
+          }
+        }
+
+        const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+        markThreadMessagesPersisted(threadId, nextMessages)
+        replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
+        rebindLiveFileChangeTurnIndices(threadId)
+        const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+        const mergedMessages = mergeMessages(previousPersisted, nextMessages, {
+          preserveMissing: options.silent === true,
+        })
+        setPersistedMessagesForThread(threadId, mergedMessages)
+
+        const previousLiveAgent = liveAgentMessagesByThreadId.value[threadId] ?? []
         const nextLiveAgent = removeRedundantLiveAgentMessages(previousLiveAgent, nextMessages)
         setLiveAgentMessagesForThread(threadId, nextLiveAgent)
-      } else {
-        clearLiveAgentMessagesForThread(threadId)
-      }
-      removeLiveCommandsPersistedIn(threadId, nextMessages)
-      removeLiveFileChangesPersistedIn(threadId, nextMessages)
+        removeLiveCommandsPersistedIn(threadId, nextMessages)
+        removeLiveFileChangesPersistedIn(threadId, nextMessages)
 
-      loadedMessagesByThreadId.value = {
-        ...loadedMessagesByThreadId.value,
-        [threadId]: true,
-      }
-      lastMessageLoadAtByThreadId.set(threadId, Date.now())
+        loadedMessagesByThreadId.value = {
+          ...loadedMessagesByThreadId.value,
+          [threadId]: true,
+        }
 
-      if (version) {
-        loadedVersionByThreadId.value = {
-          ...loadedVersionByThreadId.value,
-          [threadId]: version,
+        lastMessageLoadAtByThreadId.set(threadId, Date.now())
+
+        if (version) {
+          loadedVersionByThreadId.value = {
+            ...loadedVersionByThreadId.value,
+            [threadId]: version,
+          }
         }
-      }
-      setThreadInProgress(threadId, inProgress)
-      if (activeTurnId) {
-        activeTurnIdByThreadId.value = {
-          ...activeTurnIdByThreadId.value,
-          [threadId]: activeTurnId,
+        setThreadInProgress(threadId, inProgress)
+        if (activeTurnId) {
+          activeTurnIdByThreadId.value = {
+            ...activeTurnIdByThreadId.value,
+            [threadId]: activeTurnId,
+          }
+        } else if (activeTurnIdByThreadId.value[threadId]) {
+          activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
         }
-      } else if (activeTurnIdByThreadId.value[threadId]) {
-        activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
-      }
-      if (!inProgress) {
-        clearCompletedTurnLiveState(threadId)
-      }
-      markThreadAsRead(threadId)
+        if (!inProgress) {
+          clearCompletedTurnLiveState(threadId)
+          clearLiveAgentMessagesForThread(threadId)
+        }
+        markThreadAsRead(threadId)
       } finally {
-      if (shouldShowLoading) {
-        isLoadingMessages.value = false
-      }
+        if (shouldShowLoading) {
+          isLoadingMessages.value = false
+        }
       }
     })().finally(() => {
       loadMessagePromiseByThreadId.delete(threadId)
