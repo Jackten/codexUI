@@ -749,6 +749,7 @@ import type { ComposerDraftPayload, ThreadComposerExposed } from './components/c
 import type { GithubTipsScope, GithubTrendingProject, LocalDirectoryEntry, TelegramStatus, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, normalizePathForUi } from './pathUtils.js'
+import { readTimedCacheValue, type TimedCacheEntry } from './composables/threadPerformanceUtils'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
@@ -756,6 +757,7 @@ const SkillsHub = defineAsyncComponent(() => import('./components/content/Skills
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
 const ACCOUNTS_SECTION_COLLAPSED_STORAGE_KEY = 'codex-web-local.accounts-section-collapsed.v1'
+const THREAD_BRANCH_CACHE_TTL_MS = 15_000
 const worktreeName = import.meta.env.VITE_WORKTREE_NAME ?? 'unknown'
 const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 const SETTINGS_HELP = {
@@ -997,6 +999,9 @@ const threadBranchOptions = ref<WorktreeBranchOption[]>([])
 const currentThreadBranch = ref<string | null>(null)
 const isLoadingThreadBranches = ref(false)
 const isSwitchingThreadBranch = ref(false)
+const threadBranchStateCache = new Map<string, TimedCacheEntry<{ options: WorktreeBranchOption[]; currentBranch: string | null }>>()
+const inFlightThreadBranchLoadsByCwd = new Map<string, Promise<{ options: WorktreeBranchOption[]; currentBranch: string | null }>>()
+let threadBranchLoadTimer: ReturnType<typeof setTimeout> | null = null
 const createFolderInputRef = ref<HTMLInputElement | null>(null)
 const accounts = ref<UiAccountEntry[]>([])
 const isRefreshingAccounts = ref(false)
@@ -1370,6 +1375,10 @@ onUnmounted(() => {
   if (threadSearchTimer) {
     clearTimeout(threadSearchTimer)
     threadSearchTimer = null
+  }
+  if (threadBranchLoadTimer) {
+    clearTimeout(threadBranchLoadTimer)
+    threadBranchLoadTimer = null
   }
   stopPolling()
 })
@@ -2075,9 +2084,29 @@ async function loadThreadBranches(cwd: string): Promise<void> {
     currentThreadBranch.value = null
     return
   }
+
+  const cached = readTimedCacheValue(threadBranchStateCache, targetCwd, Date.now(), THREAD_BRANCH_CACHE_TTL_MS)
+  if (cached) {
+    threadBranchOptions.value = cached.options
+    currentThreadBranch.value = cached.currentBranch
+    return
+  }
+
   isLoadingThreadBranches.value = true
   try {
-    const state = await getGitBranchState(targetCwd)
+    const existingRequest = inFlightThreadBranchLoadsByCwd.get(targetCwd)
+    const request = existingRequest ?? getGitBranchState(targetCwd)
+      .then((state) => ({ options: state.options, currentBranch: state.currentBranch }))
+      .finally(() => {
+        inFlightThreadBranchLoadsByCwd.delete(targetCwd)
+      })
+
+    if (!existingRequest) {
+      inFlightThreadBranchLoadsByCwd.set(targetCwd, request)
+    }
+
+    const state = await request
+    threadBranchStateCache.set(targetCwd, { value: state, fetchedAt: Date.now() })
     threadBranchOptions.value = state.options
     currentThreadBranch.value = state.currentBranch
   } catch {
@@ -2086,6 +2115,23 @@ async function loadThreadBranches(cwd: string): Promise<void> {
   } finally {
     isLoadingThreadBranches.value = false
   }
+}
+
+function scheduleLoadThreadBranches(cwd: string): void {
+  if (threadBranchLoadTimer) {
+    clearTimeout(threadBranchLoadTimer)
+    threadBranchLoadTimer = null
+  }
+  const targetCwd = cwd.trim()
+  if (!targetCwd) {
+    threadBranchOptions.value = []
+    currentThreadBranch.value = null
+    return
+  }
+  threadBranchLoadTimer = setTimeout(() => {
+    threadBranchLoadTimer = null
+    void loadThreadBranches(targetCwd)
+  }, 150)
 }
 
 function onSelectContentHeaderBranch(value: string): void {
@@ -2105,6 +2151,7 @@ function onSelectContentHeaderBranch(value: string): void {
     .then((branch) => {
       currentThreadBranch.value = branch || targetBranch
       isReviewPaneOpen.value = false
+      threadBranchStateCache.delete(cwd.trim())
       return loadThreadBranches(cwd)
     })
     .catch((error: unknown) => {
@@ -3050,11 +3097,15 @@ watch(
   () => [route.name, composerCwd.value] as const,
   ([routeName, cwd]) => {
     if (routeName !== 'thread') {
+      if (threadBranchLoadTimer) {
+        clearTimeout(threadBranchLoadTimer)
+        threadBranchLoadTimer = null
+      }
       threadBranchOptions.value = []
       currentThreadBranch.value = null
       return
     }
-    void loadThreadBranches(cwd)
+    scheduleLoadThreadBranches(cwd)
   },
   { immediate: true },
 )

@@ -54,6 +54,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
+import { readTimedCacheValue, selectThreadsToEvict, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -73,6 +74,8 @@ const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const EVENT_SYNC_DEBOUNCE_MS = 220
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
+const SKILLS_CACHE_TTL_MS = 15_000
+const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.2-codex'
@@ -1044,6 +1047,9 @@ export function useDesktopState() {
   let shouldAutoScrollOnNextAgentEvent = false
   const pendingTurnStartsById = new Map<string, TurnStartedInfo>()
   const fallbackRetryInFlightThreadIds = new Set<string>()
+  const skillsCacheByCwd = new Map<string, TimedCacheEntry<SkillInfo[]>>()
+  const inFlightSkillsRefreshByCwd = new Map<string, Promise<SkillInfo[]>>()
+  let loadedThreadAccessOrder: string[] = []
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1859,6 +1865,70 @@ export function useDesktopState() {
     persistedMessagesByThreadId.value = {
       ...persistedMessagesByThreadId.value,
       [threadId]: nextMessages,
+    }
+  }
+
+  function dropThreadLoadedState(threadId: string): void {
+    loadedThreadAccessOrder = loadedThreadAccessOrder.filter((value) => value !== threadId)
+    persistedMessagesByThreadId.value = omitKey(persistedMessagesByThreadId.value, threadId)
+    livePlanMessagesByThreadId.value = omitKey(livePlanMessagesByThreadId.value, threadId)
+    liveAgentMessagesByThreadId.value = omitKey(liveAgentMessagesByThreadId.value, threadId)
+    liveReasoningTextByThreadId.value = omitKey(liveReasoningTextByThreadId.value, threadId)
+    liveCommandsByThreadId.value = omitKey(liveCommandsByThreadId.value, threadId)
+    liveFileChangeMessagesByThreadId.value = omitKey(liveFileChangeMessagesByThreadId.value, threadId)
+    loadedVersionByThreadId.value = omitKey(loadedVersionByThreadId.value, threadId)
+    loadedMessagesByThreadId.value = omitKey(loadedMessagesByThreadId.value, threadId)
+    resumedThreadById.value = omitKey(resumedThreadById.value, threadId)
+    turnIndexByTurnIdByThreadId.value = omitKey(turnIndexByTurnIdByThreadId.value, threadId)
+    turnSummaryByThreadId.value = omitKey(turnSummaryByThreadId.value, threadId)
+    turnActivityByThreadId.value = omitKey(turnActivityByThreadId.value, threadId)
+    turnErrorByThreadId.value = omitKey(turnErrorByThreadId.value, threadId)
+    activeTurnIdByThreadId.value = omitKey(activeTurnIdByThreadId.value, threadId)
+    interruptBlockedUntilPersistedByThreadId.value = omitKey(interruptBlockedUntilPersistedByThreadId.value, threadId)
+    persistedUserMessageByThreadId.value = omitKey(persistedUserMessageByThreadId.value, threadId)
+    pendingTurnRequestByThreadId.value = omitKey(pendingTurnRequestByThreadId.value, threadId)
+  }
+
+  function collectProtectedLoadedThreadIds(): Set<string> {
+    const protectedIds = new Set<string>()
+    if (selectedThreadId.value) {
+      protectedIds.add(selectedThreadId.value)
+    }
+
+    for (const [threadId, inProgress] of Object.entries(inProgressById.value)) {
+      if (inProgress) protectedIds.add(threadId)
+    }
+    for (const [threadId, queuedMessages] of Object.entries(queuedMessagesByThreadId.value)) {
+      if (queuedMessages.length > 0) protectedIds.add(threadId)
+    }
+    for (const [threadId, processing] of Object.entries(queueProcessingByThreadId.value)) {
+      if (processing) protectedIds.add(threadId)
+    }
+    for (const [threadId, pendingTurn] of Object.entries(pendingTurnRequestByThreadId.value)) {
+      if (pendingTurn) protectedIds.add(threadId)
+    }
+    for (const [threadId, requests] of Object.entries(pendingServerRequestsByThreadId.value)) {
+      if (requests.length > 0) protectedIds.add(threadId)
+    }
+
+    return protectedIds
+  }
+
+  function pruneLoadedThreadStateBudget(): void {
+    const loadedThreadIds = Object.entries(loadedMessagesByThreadId.value)
+      .filter(([, loaded]) => loaded === true)
+      .map(([threadId]) => threadId)
+
+    const evictedThreadIds = selectThreadsToEvict({
+      loadedThreadIds,
+      accessOrder: loadedThreadAccessOrder,
+      selectedThreadId: selectedThreadId.value,
+      retainCount: MAX_LOADED_THREAD_STATES,
+      protectedThreadIds: collectProtectedLoadedThreadIds(),
+    })
+
+    for (const threadId of evictedThreadIds) {
+      dropThreadLoadedState(threadId)
     }
   }
 
@@ -3439,6 +3509,8 @@ export function useDesktopState() {
           ...loadedMessagesByThreadId.value,
           [threadId]: true,
         }
+        loadedThreadAccessOrder = touchThreadAccessOrder(loadedThreadAccessOrder, threadId)
+        pruneLoadedThreadStateBudget()
 
         const version = currentThreadVersion(threadId)
         if (version) {
@@ -3483,12 +3555,45 @@ export function useDesktopState() {
     await loadMessages(threadId, options)
   }
 
-  async function refreshSkills(): Promise<void> {
+  async function refreshSkills(options: { force?: boolean; threadId?: string } = {}): Promise<void> {
+    const targetThreadId = options.threadId?.trim() || selectedThreadId.value
+    const targetThread = targetThreadId
+      ? allThreads.value.find((thread) => thread.id === targetThreadId) ?? null
+      : null
+    const selectedCwd = targetThread?.cwd?.trim() ?? ''
+    const cacheKey = selectedCwd || '__global__'
+
+    if (!options.force) {
+      const cached = readTimedCacheValue(skillsCacheByCwd, cacheKey, Date.now(), SKILLS_CACHE_TTL_MS)
+      if (cached) {
+        if (targetThreadId === selectedThreadId.value) {
+          installedSkills.value = cached
+        }
+        return
+      }
+    }
+
+    const existingRequest = inFlightSkillsRefreshByCwd.get(cacheKey)
+    if (existingRequest) {
+      const skills = await existingRequest
+      if (targetThreadId === selectedThreadId.value) {
+        installedSkills.value = skills
+      }
+      return
+    }
+
     try {
-      const selectedCwd = selectedThread.value?.cwd?.trim() ?? ''
-      installedSkills.value = await getSkillsList(selectedCwd ? [selectedCwd] : undefined)
+      const request = getSkillsList(selectedCwd ? [selectedCwd] : undefined)
+      inFlightSkillsRefreshByCwd.set(cacheKey, request)
+      const skills = await request
+      skillsCacheByCwd.set(cacheKey, { value: skills, fetchedAt: Date.now() })
+      if (targetThreadId === selectedThreadId.value) {
+        installedSkills.value = skills
+      }
     } catch {
       // keep previous skills on failure
+    } finally {
+      inFlightSkillsRefreshByCwd.delete(cacheKey)
     }
   }
 
@@ -3531,12 +3636,13 @@ export function useDesktopState() {
 
   async function selectThread(threadId: string) {
     setSelectedThreadId(threadId)
+    if (loadedMessagesByThreadId.value[threadId] === true) {
+      loadedThreadAccessOrder = touchThreadAccessOrder(loadedThreadAccessOrder, threadId)
+    }
 
     try {
-      await Promise.all([
-        loadMessages(threadId),
-        refreshSkills(),
-      ])
+      await loadMessages(threadId)
+      void refreshSkills({ threadId })
     } catch (unknownError) {
       error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
     }
