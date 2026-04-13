@@ -3,6 +3,10 @@ export type TimedCacheEntry<T> = {
   fetchedAt: number
 }
 
+export function isTimestampFresh(fetchedAt: number, nowMs: number, ttlMs: number): boolean {
+  return fetchedAt > 0 && nowMs - fetchedAt <= ttlMs
+}
+
 export function readTimedCacheValue<T>(
   cache: Map<string, TimedCacheEntry<T>>,
   key: string,
@@ -11,8 +15,27 @@ export function readTimedCacheValue<T>(
 ): T | null {
   const entry = cache.get(key)
   if (!entry) return null
-  if (nowMs - entry.fetchedAt > ttlMs) return null
+  if (!isTimestampFresh(entry.fetchedAt, nowMs, ttlMs)) return null
   return entry.value
+}
+
+export function getOrStartInFlightRequest<T>(
+  inFlightRequests: Map<string, Promise<T>>,
+  key: string,
+  createRequest: () => Promise<T>,
+): Promise<T> {
+  const existingRequest = inFlightRequests.get(key)
+  if (existingRequest) return existingRequest
+
+  const request = createRequest()
+    .finally(() => {
+      if (inFlightRequests.get(key) === request) {
+        inFlightRequests.delete(key)
+      }
+    })
+
+  inFlightRequests.set(key, request)
+  return request
 }
 
 export function touchThreadAccessOrder(order: string[], threadId: string): string[] {

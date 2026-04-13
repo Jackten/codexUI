@@ -4,7 +4,7 @@ import {
   archiveThread,
   forkThread,
   getAvailableCollaborationModes,
-  getAccountRateLimits,
+  getAccountRateLimitsResponse,
   renameThread,
   getAvailableModelIds,
   getCurrentModelConfig,
@@ -32,6 +32,7 @@ import {
   type SkillInfo,
 } from '../api/codexGateway'
 import { normalizeFileChangeStatus, toUiFileChanges } from '../api/normalizers/v2'
+import type { GetAccountRateLimitsResponse } from '../api/appServerDtos'
 import type {
   CollaborationModeKind,
   CollaborationModeOption,
@@ -54,7 +55,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { readTimedCacheValue, selectThreadsToEvict, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -74,6 +75,8 @@ const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const EVENT_SYNC_DEBOUNCE_MS = 220
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
+const THREAD_GROUPS_CACHE_TTL_MS = 1_500
+const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 1_000
 const SKILLS_CACHE_TTL_MS = 15_000
 const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
@@ -1039,7 +1042,11 @@ export function useDesktopState() {
   let rateLimitRefreshTimer: number | null = null
   const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   const inFlightLoadMessagesByThreadId = new Map<string, Promise<void>>()
+  const inFlightStateRefreshByKey = new Map<string, Promise<void>>()
   let rateLimitRefreshPromise: Promise<void> | null = null
+  let cachedRateLimitsResponse: GetAccountRateLimitsResponse | null = null
+  let lastRateLimitsResponseAt = 0
+  let lastLoadedThreadsAt = 0
   let pendingThreadsRefresh = false
   const pendingThreadMessageRefresh = new Set<string>()
   let hasHydratedWorkspaceRootsState = false
@@ -1409,7 +1416,18 @@ export function useDesktopState() {
     }
   }
 
-  async function refreshRateLimits(): Promise<void> {
+  function applyRateLimitsResponse(payload: GetAccountRateLimitsResponse | null): void {
+    accountRateLimitSnapshots.value = payload ? normalizeRateLimitSnapshotsPayload(payload) : []
+    setCodexRateLimit(payload ? pickCodexRateLimitSnapshot(payload) : null)
+  }
+
+  async function refreshRateLimits(options: { force?: boolean } = {}): Promise<void> {
+    const now = Date.now()
+    if (!options.force && cachedRateLimitsResponse && isTimestampFresh(lastRateLimitsResponseAt, now, RATE_LIMITS_RESPONSE_CACHE_TTL_MS)) {
+      applyRateLimitsResponse(cachedRateLimitsResponse)
+      return
+    }
+
     if (rateLimitRefreshPromise) {
       await rateLimitRefreshPromise
       return
@@ -1417,7 +1435,10 @@ export function useDesktopState() {
 
     rateLimitRefreshPromise = (async () => {
       try {
-        accountRateLimitSnapshots.value = normalizeRateLimitSnapshotsPayload(await getAccountRateLimits())
+        const payload = await getAccountRateLimitsResponse()
+        cachedRateLimitsResponse = payload
+        lastRateLimitsResponseAt = Date.now()
+        applyRateLimitsResponse(payload)
       } catch {
         // Keep the last known rate-limit state if the endpoint is temporarily unavailable.
       } finally {
@@ -3411,49 +3432,57 @@ export function useDesktopState() {
     }
   }
 
-  async function loadThreads() {
-    if (!hasLoadedThreads.value) {
-      isLoadingThreads.value = true
+  async function loadThreads(options: { force?: boolean } = {}) {
+    const now = Date.now()
+    if (!options.force && hasLoadedThreads.value && isTimestampFresh(lastLoadedThreadsAt, now, THREAD_GROUPS_CACHE_TTL_MS)) {
+      return
     }
 
-    try {
-      const [groups] = await Promise.all([getThreadGroups(), loadThreadTitleCacheIfNeeded()])
-      await hydrateWorkspaceRootsStateIfNeeded(groups)
-
-      const visibleGroups = await filterGroupsByWorkspaceRoots(groups)
-
-      const nextProjectOrder = mergeProjectOrder(projectOrder.value, visibleGroups)
-      if (!areStringArraysEqual(projectOrder.value, nextProjectOrder)) {
-        projectOrder.value = nextProjectOrder
-        saveProjectOrder(projectOrder.value)
+    await getOrStartInFlightRequest(inFlightStateRefreshByKey, 'thread-groups', async () => {
+      if (!hasLoadedThreads.value) {
+        isLoadingThreads.value = true
       }
 
-      const orderedGroups = orderGroupsByProjectOrder(visibleGroups, projectOrder.value)
-      markServerListedThreads(new Set(flattenThreads(orderedGroups).map((thread) => thread.id)))
-      const mergedWithInProgress = mergeIncomingWithLocalInProgressThreads(
-        sourceGroups.value,
-        orderedGroups,
-        inProgressById.value,
-      )
-      sourceGroups.value = mergeThreadGroups(sourceGroups.value, mergedWithInProgress)
-      inProgressById.value = pruneThreadStateMap(
-        inProgressById.value,
-        new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id)),
-      )
-      applyThreadFlags()
-      hasLoadedThreads.value = true
+      try {
+        const [groups] = await Promise.all([getThreadGroups(), loadThreadTitleCacheIfNeeded()])
+        await hydrateWorkspaceRootsStateIfNeeded(groups)
 
-      const flatThreads = flattenThreads(projectGroups.value)
-      pruneThreadScopedState(flatThreads)
+        const visibleGroups = await filterGroupsByWorkspaceRoots(groups)
 
-      const currentExists = flatThreads.some((thread) => thread.id === selectedThreadId.value)
+        const nextProjectOrder = mergeProjectOrder(projectOrder.value, visibleGroups)
+        if (!areStringArraysEqual(projectOrder.value, nextProjectOrder)) {
+          projectOrder.value = nextProjectOrder
+          saveProjectOrder(projectOrder.value)
+        }
 
-      if (!currentExists) {
-        setSelectedThreadId(flatThreads[0]?.id ?? '')
+        const orderedGroups = orderGroupsByProjectOrder(visibleGroups, projectOrder.value)
+        markServerListedThreads(new Set(flattenThreads(orderedGroups).map((thread) => thread.id)))
+        const mergedWithInProgress = mergeIncomingWithLocalInProgressThreads(
+          sourceGroups.value,
+          orderedGroups,
+          inProgressById.value,
+        )
+        sourceGroups.value = mergeThreadGroups(sourceGroups.value, mergedWithInProgress)
+        inProgressById.value = pruneThreadStateMap(
+          inProgressById.value,
+          new Set(flattenThreads(sourceGroups.value).map((thread) => thread.id)),
+        )
+        applyThreadFlags()
+        hasLoadedThreads.value = true
+        lastLoadedThreadsAt = Date.now()
+
+        const flatThreads = flattenThreads(projectGroups.value)
+        pruneThreadScopedState(flatThreads)
+
+        const currentExists = flatThreads.some((thread) => thread.id === selectedThreadId.value)
+
+        if (!currentExists) {
+          setSelectedThreadId(flatThreads[0]?.id ?? '')
+        }
+      } finally {
+        isLoadingThreads.value = false
       }
-    } finally {
-      isLoadingThreads.value = false
-    }
+    })
   }
 
   async function loadMessages(threadId: string, options: { silent?: boolean } = {}) {
@@ -3476,18 +3505,20 @@ export function useDesktopState() {
     const loadPromise = (async () => {
       try {
         const needsResume = resumedThreadById.value[threadId] !== true
-        const resumePromise = needsResume ? resumeThread(threadId) : null
-        const detailPromise = getThreadDetail(threadId)
-
-        const [resumedThread, detail] = await Promise.all([resumePromise, detailPromise])
-
-        if (resumedThread) {
-          setThreadModelId(threadId, resumedThread.model)
-          resumedThreadById.value = {
-            ...resumedThreadById.value,
-            [threadId]: true,
-          }
-        }
+        const resumePromise = needsResume
+          ? resumeThread(threadId)
+              .then((resumedThread) => {
+                setThreadModelId(threadId, resumedThread.model)
+                resumedThreadById.value = {
+                  ...resumedThreadById.value,
+                  [threadId]: true,
+                }
+              })
+              .catch(() => {
+                // Keep message loading responsive even if thread resume metadata is temporarily unavailable.
+              })
+          : null
+        const detail = await getThreadDetail(threadId)
 
         const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
         markThreadMessagesPersisted(threadId, nextMessages)
@@ -3532,6 +3563,10 @@ export function useDesktopState() {
           clearCompletedTurnLiveState(threadId)
         }
         markThreadAsRead(threadId)
+
+        if (resumePromise) {
+          void resumePromise
+        }
       } finally {
         if (shouldShowLoading) {
           isLoadingMessages.value = false
@@ -3597,12 +3632,13 @@ export function useDesktopState() {
     }
   }
 
-  async function refreshCodexRateLimits(): Promise<void> {
-    try {
-      setCodexRateLimit(await getAccountRateLimits())
-    } catch {
-      // Keep the last known quota snapshot on transient failures.
-    }
+  function invalidateFreshThreadListState(): void {
+    lastLoadedThreadsAt = 0
+  }
+
+  function invalidateRateLimitsState(): void {
+    cachedRateLimitsResponse = null
+    lastRateLimitsResponseAt = 0
   }
 
   async function refreshAll(
@@ -3619,7 +3655,6 @@ export function useDesktopState() {
         refreshRateLimits(),
         refreshCollaborationModes(),
         refreshSkills(),
-        refreshCodexRateLimits(),
       ]).then(() => undefined)
       if (includeSelectedThreadMessages) {
         await loadMessages(selectedThreadId.value)
@@ -3651,7 +3686,8 @@ export function useDesktopState() {
   async function archiveThreadById(threadId: string) {
     try {
       await archiveThread(threadId)
-      await loadThreads()
+      invalidateFreshThreadListState()
+      await loadThreads({ force: true })
 
       if (selectedThreadId.value === threadId) {
         await loadMessages(selectedThreadId.value)
@@ -3774,7 +3810,8 @@ export function useDesktopState() {
 
       await renameThreadById(forkedThreadId, forkedThreadTitle)
       setSelectedThreadId(forkedThreadId)
-      void loadThreads().catch(() => {})
+      invalidateFreshThreadListState()
+      void loadThreads({ force: true }).catch(() => {})
       return forkedThreadId
     } catch (unknownError) {
       error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
@@ -4447,7 +4484,7 @@ export function useDesktopState() {
 
     try {
       if (shouldRefreshThreads) {
-        await loadThreads()
+        await loadThreads({ force: true })
       }
 
       const activeThreadId = selectedThreadId.value
