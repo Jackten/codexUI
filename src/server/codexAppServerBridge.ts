@@ -3170,13 +3170,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               threadId,
               includeTurns: true,
             })
-            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
 
-            const record = asRecord(sanitized)
-            const thread = asRecord(record?.thread)
-            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
-
-            const sessionPath = readNonEmptyString(thread?.path)
+            const rawRecord = asRecord(threadReadResult)
+            const rawThread = asRecord(rawRecord?.thread)
+            const sessionPath = readNonEmptyString(rawThread?.path)
             let sessionSize = 0
             if (sessionPath && isAbsolute(sessionPath)) {
               try {
@@ -3184,6 +3181,15 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 sessionSize = s.size
               } catch { /* missing */ }
             }
+
+            const boundedThreadReadResult = sessionSize > MAX_LIVE_STATE_SESSION_LOG_BYTES
+              ? trimThreadTurnsInRpcResult('thread/read', threadReadResult)
+              : threadReadResult
+            const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', boundedThreadReadResult)
+
+            const record = asRecord(sanitized)
+            const thread = asRecord(record?.thread)
+            const rawTurns = Array.isArray(thread?.turns) ? thread.turns : []
 
             if (sessionSize > 0 && sessionSize <= MAX_THREAD_SNAPSHOT_SESSION_BYTES) {
               appServer.storeThreadReadSnapshot(threadId, sanitized)
