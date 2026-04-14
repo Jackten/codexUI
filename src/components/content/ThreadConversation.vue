@@ -1279,6 +1279,29 @@ const LOAD_MORE_CHUNK = 30
 const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
 const LOCAL_PATH_PROBE_TTL_MS = 15_000
 
+let suppressProgrammaticScrollEvents = false
+
+function rememberLocalScrollState(nextState: ThreadScrollState): void {
+  localScrollState.value = nextState
+}
+
+function effectiveSavedScrollState(): ThreadScrollState | null {
+  return localScrollState.value ?? props.scrollState ?? null
+}
+
+function shouldPreferLatestRenderWindow(): boolean {
+  const savedState = effectiveSavedScrollState()
+  return autoFollowOutput.value || !savedState || savedState.isAtBottom !== false
+}
+
+function withProgrammaticScrollGuard(apply: () => void): void {
+  suppressProgrammaticScrollEvents = true
+  apply()
+  requestAnimationFrame(() => {
+    suppressProgrammaticScrollEvents = false
+  })
+}
+
 const renderWindowStart = ref(0)
 const isLoadingMore = ref(false)
 
@@ -4012,8 +4035,10 @@ function scrollToBottom(): void {
   const container = conversationListRef.value
   const anchor = bottomAnchorRef.value
   if (!container || !anchor) return
-  container.scrollTop = container.scrollHeight
-  anchor.scrollIntoView({ block: 'end' })
+  withProgrammaticScrollGuard(() => {
+    container.scrollTop = container.scrollHeight
+    anchor.scrollIntoView({ block: 'end' })
+  })
 }
 
 function isAtBottom(container: HTMLElement): boolean {
@@ -4025,13 +4050,15 @@ function emitScrollState(container: HTMLElement): void {
   if (!props.activeThreadId) return
   const maxScrollTop = Math.max(container.scrollHeight - container.clientHeight, 0)
   const scrollRatio = maxScrollTop > 0 ? Math.min(Math.max(container.scrollTop / maxScrollTop, 0), 1) : 1
+  const nextState: ThreadScrollState = {
+    scrollTop: container.scrollTop,
+    isAtBottom: isAtBottom(container),
+    scrollRatio,
+  }
+  rememberLocalScrollState(nextState)
   emit('updateScrollState', {
     threadId: props.activeThreadId,
-    state: {
-      scrollTop: container.scrollTop,
-      isAtBottom: isAtBottom(container),
-      scrollRatio,
-    },
+    state: nextState,
   })
 }
 
@@ -4044,7 +4071,7 @@ function applySavedScrollState(): void {
     return
   }
 
-  const savedState = props.scrollState
+  const savedState = effectiveSavedScrollState()
   if (!savedState || savedState.isAtBottom) {
     emitScrollState(container)
     return
@@ -4052,7 +4079,9 @@ function applySavedScrollState(): void {
 
   const maxScrollTop = Math.max(container.scrollHeight - container.clientHeight, 0)
   const targetScrollTop = savedState.scrollTop
-  container.scrollTop = Math.min(Math.max(targetScrollTop, 0), maxScrollTop)
+  withProgrammaticScrollGuard(() => {
+    container.scrollTop = Math.min(Math.max(targetScrollTop, 0), maxScrollTop)
+  })
   emitScrollState(container)
 }
 
@@ -4119,7 +4148,10 @@ async function loadMoreAbove(): Promise<void> {
 
   // Discard scroll restoration if the thread changed while we were awaiting.
   if (props.activeThreadId === threadIdAtStart) {
-    container.scrollTop = prevScrollTop + (container.scrollHeight - prevScrollHeight)
+    withProgrammaticScrollGuard(() => {
+      container.scrollTop = prevScrollTop + (container.scrollHeight - prevScrollHeight)
+    })
+    emitScrollState(container)
     isLoadingMore.value = false
   }
 }
@@ -4247,7 +4279,11 @@ watch(
   () => props.isLoading,
   async (loading) => {
     if (loading) return
-    renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    if (shouldPreferLatestRenderWindow()) {
+      renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    } else {
+      renderWindowStart.value = Math.min(renderWindowStart.value, Math.max(0, props.messages.length - 1))
+    }
     await scheduleScrollRestore()
   },
 )
@@ -4255,8 +4291,8 @@ watch(
 watch(
   () => props.activeThreadId,
   () => {
-    localScrollState.value = null
-    autoFollowOutput.value = true
+    localScrollState.value = props.scrollState ?? null
+    autoFollowOutput.value = props.scrollState?.isAtBottom !== false
     modalImageUrl.value = ''
     isLoadingMore.value = false
     localPathProbeGeneration += 1
@@ -4264,7 +4300,11 @@ watch(
     localPathProbeTimestamps.clear()
     pendingLocalPathProbes.clear()
     // Apply immediately for cached threads where isLoading never toggles.
-    renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    if (shouldPreferLatestRenderWindow()) {
+      renderWindowStart.value = Math.max(0, props.messages.length - RENDER_WINDOW_SIZE)
+    } else {
+      renderWindowStart.value = Math.min(renderWindowStart.value, Math.max(0, props.messages.length - 1))
+    }
   },
   { flush: 'post' },
 )
@@ -4272,6 +4312,7 @@ watch(
 function onConversationScroll(): void {
   const container = conversationListRef.value
   if (!container || props.isLoading) return
+  if (suppressProgrammaticScrollEvents) return
   autoFollowOutput.value = isAtBottom(container)
   emitScrollState(container)
   if (hasMoreAbove.value && !isLoadingMore.value && container.scrollTop < LOAD_MORE_SCROLL_THRESHOLD_PX) {
