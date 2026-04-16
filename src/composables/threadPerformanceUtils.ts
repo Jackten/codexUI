@@ -38,6 +38,45 @@ export function getOrStartInFlightRequest<T>(
   return request
 }
 
+export async function getOrRefreshTimedCacheValue<T>(params: {
+  cache: Map<string, TimedCacheEntry<T>>
+  inFlightRequests: Map<string, Promise<T>>
+  key: string
+  ttlMs: number
+  force?: boolean
+  createRequest: () => Promise<T>
+}): Promise<T> {
+  const { cache, inFlightRequests, key, ttlMs, force, createRequest } = params
+  if (!force) {
+    const cached = readTimedCacheValue(cache, key, Date.now(), ttlMs)
+    if (cached !== null) return cached
+  }
+
+  return getOrStartInFlightRequest(inFlightRequests, key, async () => {
+    const value = await createRequest()
+    cache.set(key, {
+      value,
+      fetchedAt: Date.now(),
+    })
+    return value
+  })
+}
+
+export function shouldRefreshThreadListForNotificationMethod(method: string): boolean {
+  if (!method || method === 'thread/tokenUsage/updated') return false
+  if (method.startsWith('item/')) return false
+  if (method.startsWith('turn/')) {
+    return (
+      method === 'turn/started' ||
+      method === 'turn/completed' ||
+      method === 'turn/cancelled' ||
+      method === 'turn/interrupted' ||
+      method === 'turn/failed'
+    )
+  }
+  return method.startsWith('thread/')
+}
+
 export function touchThreadAccessOrder(order: string[], threadId: string): string[] {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) return order

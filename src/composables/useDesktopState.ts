@@ -30,6 +30,7 @@ import {
   startThreadTurn,
   type RpcNotification,
   type SkillInfo,
+  type WorkspaceRootsState,
 } from '../api/codexGateway'
 import { normalizeFileChangeStatus, toUiFileChanges } from '../api/normalizers/v2'
 import type { GetAccountRateLimitsResponse } from '../api/appServerDtos'
@@ -55,7 +56,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -77,6 +78,8 @@ const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const THREAD_GROUPS_CACHE_TTL_MS = 1_500
 const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 1_000
+const WORKSPACE_ROOTS_STATE_CACHE_TTL_MS = 5_000
+const THREAD_TITLE_CACHE_TTL_MS = 15_000
 const SKILLS_CACHE_TTL_MS = 15_000
 const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
@@ -1056,6 +1059,9 @@ export function useDesktopState() {
   const fallbackRetryInFlightThreadIds = new Set<string>()
   const skillsCacheByCwd = new Map<string, TimedCacheEntry<SkillInfo[]>>()
   const inFlightSkillsRefreshByCwd = new Map<string, Promise<SkillInfo[]>>()
+  const workspaceRootsStateCacheByKey = new Map<string, TimedCacheEntry<WorkspaceRootsState>>()
+  const inFlightWorkspaceRootsStateByKey = new Map<string, Promise<WorkspaceRootsState>>()
+  let lastThreadTitleCacheLoadAt = 0
   let loadedThreadAccessOrder: string[] = []
 
 
@@ -1463,6 +1469,21 @@ export function useDesktopState() {
       rateLimitRefreshTimer = null
       void refreshRateLimits()
     }, RATE_LIMIT_REFRESH_DEBOUNCE_MS)
+  }
+
+  function invalidateWorkspaceRootsStateCache(): void {
+    workspaceRootsStateCacheByKey.clear()
+  }
+
+  async function loadWorkspaceRootsState(options: { force?: boolean } = {}): Promise<WorkspaceRootsState> {
+    return getOrRefreshTimedCacheValue({
+      cache: workspaceRootsStateCacheByKey,
+      inFlightRequests: inFlightWorkspaceRootsStateByKey,
+      key: 'workspace-roots-state',
+      ttlMs: WORKSPACE_ROOTS_STATE_CACHE_TTL_MS,
+      force: options.force,
+      createRequest: () => getWorkspaceRootsState(),
+    })
   }
 
   function clearDelayedTurnSync(threadId: string): void {
@@ -3328,19 +3349,15 @@ export function useDesktopState() {
   }
 
   function queueEventDrivenSync(notification: RpcNotification): void {
-    if (notification.method === 'thread/tokenUsage/updated') return
+    const method = notification.method
+    if (!shouldRefreshThreadListForNotificationMethod(method) && method === 'thread/tokenUsage/updated') return
 
     const threadId = extractThreadIdFromNotification(notification)
     if (threadId) {
       pendingThreadMessageRefresh.add(threadId)
     }
 
-    const method = notification.method
-    if (
-      method.startsWith('thread/') ||
-      method.startsWith('turn/') ||
-      method.startsWith('item/')
-    ) {
+    if (shouldRefreshThreadListForNotificationMethod(method)) {
       pendingThreadsRefresh = true
     }
 
@@ -3356,7 +3373,7 @@ export function useDesktopState() {
     hasHydratedWorkspaceRootsState = true
 
     try {
-      const rootsState = await getWorkspaceRootsState()
+      const rootsState = await loadWorkspaceRootsState()
       const hydratedOrder: string[] = []
       for (const rootPath of rootsState.order) {
         const projectName = toProjectNameFromWorkspaceRoot(rootPath)
@@ -3393,8 +3410,10 @@ export function useDesktopState() {
 
   async function loadThreadTitleCacheIfNeeded(): Promise<void> {
     if (Object.keys(threadTitleById.value).length > 0) return
+    if (isTimestampFresh(lastThreadTitleCacheLoadAt, Date.now(), THREAD_TITLE_CACHE_TTL_MS)) return
     try {
       const cache = await getThreadTitleCache()
+      lastThreadTitleCacheLoadAt = Date.now()
       if (Object.keys(cache.titles).length > 0) {
         threadTitleById.value = cache.titles
       }
@@ -3421,7 +3440,7 @@ export function useDesktopState() {
 
   async function filterGroupsByWorkspaceRoots(groups: UiProjectGroup[]): Promise<UiProjectGroup[]> {
     try {
-      const rootsState = await getWorkspaceRootsState()
+      const rootsState = await loadWorkspaceRootsState()
       if (rootsState.order.length === 0) return groups
       const allowedProjectNames = new Set(
         rootsState.order.map((rootPath) => toProjectNameFromWorkspaceRoot(rootPath)),
@@ -4240,7 +4259,7 @@ export function useDesktopState() {
 
   async function persistProjectLabelToGlobalState(projectName: string, displayName: string): Promise<void> {
     try {
-      const rootsState = await getWorkspaceRootsState()
+      const rootsState = await loadWorkspaceRootsState()
       const nextLabels = { ...rootsState.labels }
       let changed = false
       for (const rootPath of rootsState.order) {
@@ -4262,6 +4281,7 @@ export function useDesktopState() {
           labels: nextLabels,
           active: rootsState.active,
         })
+        invalidateWorkspaceRootsStateCache()
       }
     } catch {
       // Keep localStorage-only rename when global state is unavailable.
@@ -4317,7 +4337,7 @@ export function useDesktopState() {
 
     const removedRootPaths = new Set<string>()
     try {
-      const rootsState = await getWorkspaceRootsState()
+      const rootsState = await loadWorkspaceRootsState()
       for (const rootPath of rootsState.order) {
         if (toProjectNameFromWorkspaceRoot(rootPath) === projectName) {
           removedRootPaths.add(rootPath)
@@ -4339,7 +4359,7 @@ export function useDesktopState() {
 
     if (removedRootPaths.size > 0) {
       try {
-        const rootsState = await getWorkspaceRootsState()
+        const rootsState = await loadWorkspaceRootsState({ force: true })
         const nextOrder = rootsState.order.filter((rootPath) => !removedRootPaths.has(rootPath))
         const nextActive = rootsState.active.filter((rootPath) => !removedRootPaths.has(rootPath))
         const fallbackActive = nextActive.length === 0 && nextOrder.length > 0
@@ -4350,6 +4370,7 @@ export function useDesktopState() {
           labels: omitKeys(rootsState.labels, removedRootPaths),
           active: fallbackActive,
         })
+        invalidateWorkspaceRootsStateCache()
         return
       } catch {
         // Fall back to order-only persistence if direct removal fails.
@@ -4397,7 +4418,7 @@ export function useDesktopState() {
 
   async function persistProjectOrderToWorkspaceRoots(): Promise<void> {
     try {
-      const rootsState = await getWorkspaceRootsState()
+      const rootsState = await loadWorkspaceRootsState()
       const rootByProjectName = new Map<string, string>()
       for (const rootPath of rootsState.order) {
         const projectName = toProjectNameFromWorkspaceRoot(rootPath)
@@ -4434,6 +4455,7 @@ export function useDesktopState() {
         labels: rootsState.labels,
         active: nextActive,
       })
+      invalidateWorkspaceRootsStateCache()
     } catch {
       // Keep local project order when global state persistence is unavailable.
     }

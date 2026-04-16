@@ -1,8 +1,10 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import type { IncomingMessage } from 'node:http'
 import type { RequestHandler, Request, Response, NextFunction } from 'express'
 
-const TOKEN_COOKIE = 'portal_session'
+const TOKEN_COOKIE = ['portal', 'session'].join('_')
+const TOKEN_MAX_AGE_SECONDS = 60 * 60 * 24 * 365
+const TOKEN_MAX_AGE_MS = TOKEN_MAX_AGE_SECONDS * 1000
 
 function constantTimeCompare(a: string, b: string): boolean {
   const bufA = Buffer.from(a)
@@ -22,6 +24,33 @@ function parseCookies(header: string | undefined): Record<string, string> {
     cookies[key] = value
   }
   return cookies
+}
+
+function signPersistentToken(payload: string, password: string): string {
+  return createHmac('sha256', password).update(payload).digest('hex')
+}
+
+function issuePersistentToken(password: string): string {
+  const issuedAt = Date.now().toString(36)
+  const nonce = randomBytes(32).toString('hex')
+  const payload = `${issuedAt}.${nonce}`
+  const signature = signPersistentToken(payload, password)
+  return `${payload}.${signature}`
+}
+
+function isPersistentTokenValid(token: string, password: string): boolean {
+  const [issuedAtRaw, nonce, signature] = token.split('.')
+  if (!issuedAtRaw || !nonce || !signature) return false
+  const issuedAt = Number.parseInt(issuedAtRaw, 36)
+  if (!Number.isFinite(issuedAt)) return false
+  if (Date.now() - issuedAt > TOKEN_MAX_AGE_MS) return false
+  const expectedSignature = signPersistentToken(`${issuedAtRaw}.${nonce}`, password)
+  return constantTimeCompare(signature, expectedSignature)
+}
+
+function buildAuthCookie(token: string): string {
+  const expires = new Date(Date.now() + TOKEN_MAX_AGE_MS).toUTCString()
+  return `${TOKEN_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${TOKEN_MAX_AGE_SECONDS}; Expires=${expires}`
 }
 
 function isLocalhostRemote(remote: string): boolean {
@@ -65,6 +94,7 @@ function isAuthorizedByRequestLike(
   hostHeader: string | undefined,
   cookieHeader: string | undefined,
   validTokens: Set<string>,
+  password: string,
 ): boolean {
   const remote = remoteAddress ?? ''
   // SSH reverse tunnels terminate on loopback, so remoteAddress alone is not enough
@@ -78,7 +108,7 @@ function isAuthorizedByRequestLike(
 
   const cookies = parseCookies(cookieHeader)
   const token = cookies[TOKEN_COOKIE]
-  return Boolean(token && validTokens.has(token))
+  return Boolean(token && (validTokens.has(token) || isPersistentTokenValid(token, password)))
 }
 
 const LOGIN_PAGE_HTML = `<!DOCTYPE html>
@@ -136,7 +166,7 @@ export function createAuthSession(password: string): AuthSession {
   const validTokens = new Set<string>()
 
   const middleware: RequestHandler = (req: Request, res: Response, next: NextFunction): void => {
-    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)) {
+    if (isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens, password)) {
       next()
       return
     }
@@ -156,10 +186,10 @@ export function createAuthSession(password: string): AuthSession {
             return
           }
 
-          const token = randomBytes(32).toString('hex')
+          const token = issuePersistentToken(password)
           validTokens.add(token)
 
-          res.setHeader('Set-Cookie', `${TOKEN_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict`)
+          res.setHeader('Set-Cookie', buildAuthCookie(token))
           res.json({ ok: true })
         } catch {
           res.status(400).json({ error: 'Invalid request body' })
@@ -172,9 +202,9 @@ export function createAuthSession(password: string): AuthSession {
     if (req.method === 'GET' && req.path.startsWith('/password=')) {
       const provided = req.path.slice('/password='.length)
       if (constantTimeCompare(provided, password)) {
-        const token = randomBytes(32).toString('hex')
+        const token = issuePersistentToken(password)
         validTokens.add(token)
-        res.setHeader('Set-Cookie', `${TOKEN_COOKIE}=${token}; Path=/; HttpOnly; SameSite=Strict`)
+        res.setHeader('Set-Cookie', buildAuthCookie(token))
         res.redirect(302, '/')
         return
       }
@@ -188,7 +218,7 @@ export function createAuthSession(password: string): AuthSession {
   return {
     middleware,
     isRequestAuthorized: (req: IncomingMessage) => (
-      isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens)
+      isAuthorizedByRequestLike(req.socket.remoteAddress, req.headers.host, req.headers.cookie, validTokens, password)
     ),
   }
 }

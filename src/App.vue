@@ -749,7 +749,7 @@ import type { ComposerDraftPayload, ThreadComposerExposed } from './components/c
 import type { GithubTipsScope, GithubTrendingProject, LocalDirectoryEntry, TelegramStatus, WorktreeBranchOption } from './api/codexGateway'
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, normalizePathForUi } from './pathUtils.js'
-import { readTimedCacheValue, type TimedCacheEntry } from './composables/threadPerformanceUtils'
+import { getOrRefreshTimedCacheValue, readTimedCacheValue, type TimedCacheEntry } from './composables/threadPerformanceUtils'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
@@ -758,6 +758,7 @@ const SkillsHub = defineAsyncComponent(() => import('./components/content/Skills
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
 const ACCOUNTS_SECTION_COLLAPSED_STORAGE_KEY = 'codex-web-local.accounts-section-collapsed.v1'
 const THREAD_BRANCH_CACHE_TTL_MS = 15_000
+const PROJECT_ROOT_SUGGESTION_CACHE_TTL_MS = 15_000
 const worktreeName = import.meta.env.VITE_WORKTREE_NAME ?? 'unknown'
 const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 const SETTINGS_HELP = {
@@ -1001,6 +1002,8 @@ const isLoadingThreadBranches = ref(false)
 const isSwitchingThreadBranch = ref(false)
 const threadBranchStateCache = new Map<string, TimedCacheEntry<{ options: WorktreeBranchOption[]; currentBranch: string | null }>>()
 const inFlightThreadBranchLoadsByCwd = new Map<string, Promise<{ options: WorktreeBranchOption[]; currentBranch: string | null }>>()
+const projectRootSuggestionCache = new Map<string, TimedCacheEntry<{ name: string; path: string }>>()
+const inFlightProjectRootSuggestionsByBaseDir = new Map<string, Promise<{ name: string; path: string }>>()
 let threadBranchLoadTimer: ReturnType<typeof setTimeout> | null = null
 const createFolderInputRef = ref<HTMLInputElement | null>(null)
 const accounts = ref<UiAccountEntry[]>([])
@@ -1846,7 +1849,7 @@ function onRenameThread(payload: { threadId: string; title: string }): void {
 async function onRemoveProject(projectName: string): Promise<void> {
   await removeProject(projectName)
   await loadWorkspaceRootOptionsState()
-  void refreshDefaultProjectName()
+  void refreshDefaultProjectName({ force: true })
 }
 
 function onReorderProject(payload: { projectName: string; toIndex: number }): void {
@@ -1941,7 +1944,7 @@ function onWindowPageShow(event: PageTransitionEvent): void {
 function onWindowFocus(): void {
   if (route.name === 'home') {
     void loadWorkspaceRootOptionsState()
-    void refreshDefaultProjectName()
+    void refreshDefaultProjectName({ force: true })
   }
   maybeSyncAfterMobileResume()
 }
@@ -2167,7 +2170,7 @@ async function onCreateProject(): Promise<void> {
   const baseDir = await resolveProjectBaseDirectory()
   if (!baseDir) return
 
-  await refreshDefaultProjectName()
+  await refreshDefaultProjectName({ force: true })
   const suggestedName = defaultNewProjectName.value.trim() || 'New Project (1)'
   const projectName = window.prompt(`Create project in ${baseDir}`, suggestedName)
   if (projectName === null) return
@@ -2188,7 +2191,7 @@ async function onCreateProject(): Promise<void> {
     newThreadCwd.value = normalizedPath
     pinProjectToTop(getPathLeafName(normalizedPath))
     await loadWorkspaceRootOptionsState()
-    await refreshDefaultProjectName()
+    await refreshDefaultProjectName({ force: true })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Failed to create the project.'
     window.alert(message)
@@ -2253,7 +2256,7 @@ async function onConfirmExistingFolder(path = existingFolderBrowsePath.value): P
     newThreadCwd.value = normalizedPath
     pinProjectToTop(getPathLeafName(normalizedPath))
     await loadWorkspaceRootOptionsState()
-    await refreshDefaultProjectName()
+    await refreshDefaultProjectName({ force: true })
     onCloseExistingFolderPanel()
   } catch (error) {
     existingFolderError.value = error instanceof Error ? error.message : 'Failed to open the selected folder.'
@@ -2371,7 +2374,23 @@ async function resolveProjectBaseDirectory(): Promise<string> {
   return ''
 }
 
-async function refreshDefaultProjectName(): Promise<void> {
+async function loadProjectRootSuggestion(baseDir: string, options: { force?: boolean } = {}): Promise<{ name: string; path: string }> {
+  const normalizedBaseDir = baseDir.trim()
+  if (!normalizedBaseDir) {
+    return { name: '', path: '' }
+  }
+
+  return getOrRefreshTimedCacheValue({
+    cache: projectRootSuggestionCache,
+    inFlightRequests: inFlightProjectRootSuggestionsByBaseDir,
+    key: normalizedBaseDir,
+    ttlMs: PROJECT_ROOT_SUGGESTION_CACHE_TTL_MS,
+    force: options.force,
+    createRequest: () => getProjectRootSuggestion(normalizedBaseDir),
+  })
+}
+
+async function refreshDefaultProjectName(options: { force?: boolean } = {}): Promise<void> {
   const baseDir = getProjectBaseDirectory()
   if (!baseDir) {
     defaultNewProjectName.value = 'New Project (1)'
@@ -2379,7 +2398,7 @@ async function refreshDefaultProjectName(): Promise<void> {
   }
 
   try {
-    const suggestion = await getProjectRootSuggestion(baseDir)
+    const suggestion = await loadProjectRootSuggestion(baseDir, { force: options.force })
     defaultNewProjectName.value = suggestion.name || 'New Project (1)'
   } catch {
     defaultNewProjectName.value = 'New Project (1)'

@@ -299,24 +299,7 @@ function parseCloudflaredUrl(chunk: string): string | null {
 }
 
 function getAccessibleUrls(port: number): string[] {
-  const urls = new Set<string>([`http://localhost:${String(port)}`])
-  try {
-    const interfaces = networkInterfaces()
-    for (const entries of Object.values(interfaces)) {
-      if (!entries) {
-        continue
-      }
-      for (const entry of entries) {
-        if (entry.internal) {
-          continue
-        }
-        if (entry.family === 'IPv4') {
-          urls.add(`http://${entry.address}:${String(port)}`)
-        }
-      }
-    }
-  } catch {}
-  return Array.from(urls)
+  return [`http://localhost:${String(port)}`]
 }
 
 function isTailscaleIPv4Address(address: string): boolean {
@@ -410,7 +393,7 @@ function listenWithFallback(server: ReturnType<typeof createServer>, startPort: 
 
       server.once('error', onError)
       server.once('listening', onListening)
-      server.listen(port, '0.0.0.0')
+      server.listen(port, '127.0.0.1')
     }
 
     attempt(startPort)
@@ -540,7 +523,7 @@ async function startServer(options: {
     `  Version:  ${version}`,
     '  GitHub:   https://github.com/friuns2/codexui',
     '',
-    `  Bind:     http://0.0.0.0:${String(port)}`,
+    `  Bind:     http://127.0.0.1:${String(port)}`,
     `  Codex sandbox: ${runtimeConfig.sandboxMode}`,
     `  Approval policy: ${runtimeConfig.approvalPolicy}`,
   ]

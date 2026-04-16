@@ -5,6 +5,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { cleanupTemporaryCodexHome } from './temporaryCodexHomeCleanup.js'
 
 type AppServerLike = {
   rpc(method: string, params: unknown): Promise<unknown>
@@ -507,17 +508,7 @@ async function withTemporaryCodexAppServer<T>(
     if (disposed) return
     disposed = true
     rejectAllPending(new Error('codex app-server stopped'))
-    try {
-      proc.stdin.end()
-    } catch {
-      // ignore
-    }
-    try {
-      proc.kill('SIGTERM')
-    } catch {
-      // ignore
-    }
-    await rm(tempCodexHome, { recursive: true, force: true })
+    await cleanupTemporaryCodexHome(proc, tempCodexHome)
   }
 
   try {
