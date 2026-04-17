@@ -91,6 +91,15 @@ export function shouldRefreshThreadMessagesForNotificationMethod(method: string)
   return method.startsWith('thread/')
 }
 
+export function shouldReloadActiveThreadFromSync(params: {
+  isActiveDirty: boolean
+  hasVersionChange: boolean
+  shouldRefreshThreads: boolean
+}): boolean {
+  const { isActiveDirty, hasVersionChange } = params
+  return isActiveDirty || hasVersionChange
+}
+
 export function touchThreadAccessOrder(order: string[], threadId: string): string[] {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) return order

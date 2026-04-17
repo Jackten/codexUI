@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod } from '../src/composables/threadPerformanceUtils.ts'
+import { shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, shouldReloadActiveThreadFromSync } from '../src/composables/threadPerformanceUtils.ts'
 
 test('skips sidebar thread-list refresh for item-level notifications that only affect the open thread body', () => {
   assert.equal(shouldRefreshThreadListForNotificationMethod('item/completed'), false)
@@ -26,4 +26,25 @@ test('keeps active-thread reloads for turn lifecycle boundaries', () => {
   assert.equal(shouldRefreshThreadMessagesForNotificationMethod('turn/failed'), true)
   assert.equal(shouldRefreshThreadMessagesForNotificationMethod('turn/interrupted'), true)
   assert.equal(shouldRefreshThreadMessagesForNotificationMethod('turn/cancelled'), true)
+})
+
+test('does not reload the active thread just because the sidebar thread list refreshed', () => {
+  assert.equal(shouldReloadActiveThreadFromSync({
+    isActiveDirty: false,
+    hasVersionChange: false,
+    shouldRefreshThreads: true,
+  }), false)
+})
+
+test('reloads the active thread when it is dirty or version-changed', () => {
+  assert.equal(shouldReloadActiveThreadFromSync({
+    isActiveDirty: true,
+    hasVersionChange: false,
+    shouldRefreshThreads: false,
+  }), true)
+  assert.equal(shouldReloadActiveThreadFromSync({
+    isActiveDirty: false,
+    hasVersionChange: true,
+    shouldRefreshThreads: false,
+  }), true)
 })

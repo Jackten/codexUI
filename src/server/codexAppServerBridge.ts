@@ -12,6 +12,7 @@ import { createInterface } from 'node:readline'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { mergeCapturedItemsIntoTurns, type CapturedItem } from './capturedItemsCompaction.js'
 import { resolveLiveStateCacheTtlMs } from './liveStateCachePolicy.js'
 import { LiveStateCacheStore } from './liveStateCacheStore.js'
 import { handleReviewRoutes } from './reviewGit.js'
@@ -2136,14 +2137,6 @@ type StreamEventFrame = {
   atIso: string
 }
 
-type CapturedItem = {
-  id: string
-  type: string
-  turnId: string
-  data: Record<string, unknown>
-  completed: boolean
-}
-
 const MERGEABLE_ITEM_TYPES = new Set([
   'commandExecution',
   'fileChange',
@@ -2425,39 +2418,18 @@ class AppServerProcess {
     const capturedMap = this.capturedItemsByThreadId.get(threadId)
     if (!capturedMap || capturedMap.size === 0) return turns
 
-    const itemsByTurnId = new Map<string, CapturedItem[]>()
-    for (const captured of capturedMap.values()) {
-      let group = itemsByTurnId.get(captured.turnId)
-      if (!group) {
-        group = []
-        itemsByTurnId.set(captured.turnId, group)
-      }
-      group.push(captured)
+    const result = mergeCapturedItemsIntoTurns({
+      turns,
+      capturedItemsById: capturedMap,
+    })
+
+    if (result.nextCapturedItemsById.size === 0) {
+      this.capturedItemsByThreadId.delete(threadId)
+    } else {
+      this.capturedItemsByThreadId.set(threadId, result.nextCapturedItemsById)
     }
 
-    return turns.map((turn) => {
-      const turnRecord = asRecord(turn)
-      if (!turnRecord) return turn
-      const turnId = typeof turnRecord.id === 'string' ? turnRecord.id : ''
-      if (!turnId) return turn
-
-      const captured = itemsByTurnId.get(turnId)
-      if (!captured || captured.length === 0) return turn
-
-      const existingItems = Array.isArray(turnRecord.items) ? (turnRecord.items as Record<string, unknown>[]) : []
-      const existingIds = new Set(existingItems.map((it) => (typeof it.id === 'string' ? it.id : '')).filter(Boolean))
-
-      const newItems = captured
-        .filter((c) => !existingIds.has(c.id))
-        .map((c) => c.data)
-
-      if (newItems.length === 0) return turn
-
-      return {
-        ...turnRecord,
-        items: [...existingItems, ...newItems],
-      }
-    })
+    return result.turns
   }
 
   private sendServerRequestReply(requestId: number, reply: ServerRequestReply): void {

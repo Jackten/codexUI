@@ -56,7 +56,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, shouldReloadActiveThreadFromSync, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
 import { SKILLS_CACHE_TTL_MS, THREAD_TITLE_CACHE_TTL_MS } from './metadataCachePolicy'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -76,7 +76,6 @@ const LEGACY_COLLABORATION_MODE_STORAGE_KEY = 'codex-web-local.collaboration-mod
 const NEW_THREAD_COLLABORATION_MODE_CONTEXT = '__new-thread__'
 const EVENT_SYNC_DEBOUNCE_MS = 220
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
-const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const THREAD_GROUPS_CACHE_TTL_MS = 1_500
 const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 1_000
 const WORKSPACE_ROOTS_STATE_CACHE_TTL_MS = 5_000
@@ -1042,7 +1041,6 @@ export function useDesktopState() {
   let stopNotificationStream: (() => void) | null = null
   let eventSyncTimer: number | null = null
   let rateLimitRefreshTimer: number | null = null
-  const delayedTurnSyncTimerByThreadId = new Map<string, number>()
   const inFlightLoadMessagesByThreadId = new Map<string, Promise<void>>()
   const inFlightStateRefreshByKey = new Map<string, Promise<void>>()
   let rateLimitRefreshPromise: Promise<void> | null = null
@@ -1316,9 +1314,6 @@ export function useDesktopState() {
       }
 
       scheduleRateLimitRefresh()
-      pendingThreadMessageRefresh.add(threadId)
-      pendingThreadsRefresh = true
-      await syncFromNotifications()
     } catch (unknownError) {
       const errorMessage = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
       setTurnErrorForThread(threadId, errorMessage)
@@ -1483,25 +1478,6 @@ export function useDesktopState() {
       force: options.force,
       createRequest: () => getWorkspaceRootsState(),
     })
-  }
-
-  function clearDelayedTurnSync(threadId: string): void {
-    if (!threadId || typeof window === 'undefined') return
-    const timerId = delayedTurnSyncTimerByThreadId.get(threadId)
-    if (timerId === undefined) return
-    window.clearTimeout(timerId)
-    delayedTurnSyncTimerByThreadId.delete(threadId)
-  }
-
-  function scheduleDelayedTurnSync(threadId: string): void {
-    if (!threadId || typeof window === 'undefined') return
-    clearDelayedTurnSync(threadId)
-    const timerId = window.setTimeout(() => {
-      delayedTurnSyncTimerByThreadId.delete(threadId)
-      pendingThreadMessageRefresh.add(threadId)
-      void syncFromNotifications()
-    }, TURN_START_FOLLOW_UP_SYNC_DELAY_MS)
-    delayedTurnSyncTimerByThreadId.set(threadId, timerId)
   }
 
   function applyCachedTitlesToGroups(groups: UiProjectGroup[]): UiProjectGroup[] {
@@ -4119,11 +4095,6 @@ export function useDesktopState() {
         ...resumedThreadById.value,
         [threadId]: true,
       }
-
-      pendingThreadMessageRefresh.add(threadId)
-      pendingThreadsRefresh = true
-      await syncFromNotifications()
-      scheduleDelayedTurnSync(threadId)
     } catch (unknownError) {
       throw unknownError
     }
@@ -4515,8 +4486,13 @@ export function useDesktopState() {
       const currentVersion = currentThreadVersion(activeThreadId)
       const loadedVersion = loadedVersionByThreadId.value[activeThreadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
+      const shouldReloadActiveThread = shouldReloadActiveThreadFromSync({
+        isActiveDirty,
+        hasVersionChange,
+        shouldRefreshThreads,
+      })
 
-      if (isActiveDirty || hasVersionChange || shouldRefreshThreads) {
+      if (shouldReloadActiveThread) {
         await loadMessages(activeThreadId, { silent: true })
       }
     } catch {
@@ -4605,12 +4581,6 @@ export function useDesktopState() {
       window.clearTimeout(rateLimitRefreshTimer)
       rateLimitRefreshTimer = null
     }
-    if (typeof window !== 'undefined') {
-      for (const timerId of delayedTurnSyncTimerByThreadId.values()) {
-        window.clearTimeout(timerId)
-      }
-    }
-    delayedTurnSyncTimerByThreadId.clear()
     activeReasoningItemId = ''
     shouldAutoScrollOnNextAgentEvent = false
     persistedMessagesByThreadId.value = {}
