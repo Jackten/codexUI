@@ -750,6 +750,7 @@ import type { GithubTipsScope, GithubTrendingProject, LocalDirectoryEntry, Teleg
 import { getFreeModeStatus, setFreeMode, setFreeModeCustomKey, setCustomProvider } from './api/codexGateway'
 import { getPathLeafName, getPathParent, normalizePathForUi } from './pathUtils.js'
 import { getOrRefreshTimedCacheValue, readTimedCacheValue, type TimedCacheEntry } from './composables/threadPerformanceUtils'
+import { PROJECT_ROOT_SUGGESTION_CACHE_TTL_MS, THREAD_BRANCH_CACHE_TTL_MS } from './composables/metadataCachePolicy'
 
 const ThreadConversation = defineAsyncComponent(() => import('./components/content/ThreadConversation.vue'))
 const ReviewPane = defineAsyncComponent(() => import('./components/content/ReviewPane.vue'))
@@ -757,8 +758,6 @@ const SkillsHub = defineAsyncComponent(() => import('./components/content/Skills
 
 const SIDEBAR_COLLAPSED_STORAGE_KEY = 'codex-web-local.sidebar-collapsed.v1'
 const ACCOUNTS_SECTION_COLLAPSED_STORAGE_KEY = 'codex-web-local.accounts-section-collapsed.v1'
-const THREAD_BRANCH_CACHE_TTL_MS = 15_000
-const PROJECT_ROOT_SUGGESTION_CACHE_TTL_MS = 15_000
 const worktreeName = import.meta.env.VITE_WORKTREE_NAME ?? 'unknown'
 const appVersion = import.meta.env.VITE_APP_VERSION ?? 'unknown'
 const SETTINGS_HELP = {

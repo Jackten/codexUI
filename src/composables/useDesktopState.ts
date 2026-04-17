@@ -56,7 +56,8 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { SKILLS_CACHE_TTL_MS, THREAD_TITLE_CACHE_TTL_MS } from './metadataCachePolicy'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -79,8 +80,6 @@ const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const THREAD_GROUPS_CACHE_TTL_MS = 1_500
 const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 1_000
 const WORKSPACE_ROOTS_STATE_CACHE_TTL_MS = 5_000
-const THREAD_TITLE_CACHE_TTL_MS = 15_000
-const SKILLS_CACHE_TTL_MS = 15_000
 const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
@@ -3353,7 +3352,7 @@ export function useDesktopState() {
     if (!shouldRefreshThreadListForNotificationMethod(method) && method === 'thread/tokenUsage/updated') return
 
     const threadId = extractThreadIdFromNotification(notification)
-    if (threadId) {
+    if (threadId && shouldRefreshThreadMessagesForNotificationMethod(method)) {
       pendingThreadMessageRefresh.add(threadId)
     }
 
@@ -4513,12 +4512,11 @@ export function useDesktopState() {
       if (!activeThreadId) return
 
       const isActiveDirty = threadIdsToRefresh.has(activeThreadId)
-      const isInProgress = inProgressById.value[activeThreadId] === true
       const currentVersion = currentThreadVersion(activeThreadId)
       const loadedVersion = loadedVersionByThreadId.value[activeThreadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
 
-      if (isActiveDirty || isInProgress || hasVersionChange || shouldRefreshThreads) {
+      if (isActiveDirty || hasVersionChange || shouldRefreshThreads) {
         await loadMessages(activeThreadId, { silent: true })
       }
     } catch {

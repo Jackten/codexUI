@@ -132,6 +132,40 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - No cleanup required.
 
+## Metadata cache policy for thread switching
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/metadata-cache-policy.test.mjs`.
+2. Let the test import the metadata cache policy helpers from `src/composables/metadataCachePolicy.ts`.
+
+#### Expected Results
+- Skills, thread-title, and project-root caches stay warm across normal operator pause windows.
+- Branch and local-path probe caches stay warm long enough to avoid repeated thread-switch lag.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
+## Local-path probe heuristics
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/local-path-probe-heuristics.test.mjs`.
+2. Let the test import the probe heuristic helper from `src/components/content/localPathProbeHeuristics.ts`.
+
+#### Expected Results
+- Ordinary absolute paths, including modest spaces in real path segments, still qualify for probing.
+- Sentence-like `/root/...` prose fragments are rejected so streaming assistant text does not trigger repeated bogus path probes.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
 ## Temporary Codex account-home cleanup
 
 #### Prerequisites

@@ -851,6 +851,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { probeLocalPaths } from '../../api/codexGateway'
+import { LOCAL_PATH_PROBE_TTL_MS } from '../../composables/metadataCachePolicy'
+import { shouldProbeResolvedLocalPath } from './localPathProbeHeuristics'
 import type { ThreadScrollState, UiFileChange, UiLiveOverlay, UiMessage, UiPlanStep, UiServerRequest } from '../../types/codex'
 import { useMobile } from '../../composables/useMobile'
 
@@ -1273,11 +1275,10 @@ let highlightJsLoader: Promise<void> | null = null
 const localPathProbeTimestamps = new Map<string, number>()
 const pendingLocalPathProbes = new Set<string>()
 let localPathProbeGeneration = 0
-
+const LOCAL_PATH_SEGMENT_RE = /(^|[\\/])\.{1,2}([\\/]|$)/u
 const RENDER_WINDOW_SIZE = 50
 const LOAD_MORE_CHUNK = 30
 const LOAD_MORE_SCROLL_THRESHOLD_PX = 200
-const LOCAL_PATH_PROBE_TTL_MS = 15_000
 
 let suppressProgrammaticScrollEvents = false
 
@@ -3354,8 +3355,8 @@ function collectInlineLocalPathCandidates(text: string, output: Set<string>): vo
     if (segment.kind !== 'file') continue
     const literalResolved = resolveAbsoluteLocalPathLiteral(segment.value)
     const resolved = resolveAbsoluteLocalPath(segment.path)
-    if (literalResolved) output.add(literalResolved)
-    if (resolved && resolved !== literalResolved) output.add(resolved)
+    if (literalResolved && shouldProbeResolvedLocalPath(literalResolved)) output.add(literalResolved)
+    if (resolved && resolved !== literalResolved && shouldProbeResolvedLocalPath(resolved)) output.add(resolved)
   }
 }
 
