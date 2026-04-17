@@ -43,6 +43,116 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - Remove any test automation from the thread automation dialog or delete its folder under `$CODEX_HOME/automations/<automation-id>/`.
 
+## Loopback-only bind and no network banner
+
+#### Prerequisites
+- Run from the repo root.
+- Node dependencies are installed.
+
+#### Steps
+1. Run `node --test tests/bind-privacy.test.mjs`.
+2. Let the test start a temporary codexUI instance.
+3. Inspect the startup banner captured by the test.
+
+#### Expected Results
+- The banner shows `Bind:     http://127.0.0.1:<port>`.
+- The banner shows only the localhost URL.
+- No `Network:` lines appear.
+
+#### Rollback/Cleanup
+- The test shuts down its temporary server automatically.
+
+## Thread reading should not jump to the top during refreshes
+
+#### Prerequisites
+- Run the forked codexUI build on port 16001 or use the tailnet route on 3444.
+- Open a thread with enough content to scroll, ideally one with live plan or activity updates.
+
+#### Steps
+1. Open the thread and scroll partway down while reading.
+2. Keep the thread open through a live refresh, plan update, or other background sync.
+3. Watch whether the conversation jumps to the top when the UI updates.
+4. Repeat after switching away and back if needed.
+
+#### Expected Results
+- Background refreshes do not overwrite the user's current reading position.
+- Programmatic bottom-lock and scroll-restore writes do not emit a bogus saved scroll position.
+- Returning from a refresh should keep the thread near the same reading position instead of snapping to the top.
+
+#### Rollback/Cleanup
+- No cleanup required beyond closing the thread.
+
+## Selection metadata cache helpers
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/selection-metadata-cache.test.mjs`.
+2. Let the test import the cache helper directly from `src/composables/threadPerformanceUtils.ts`.
+
+#### Expected Results
+- Fresh cached values are reused without calling the fetcher again.
+- Concurrent cache misses collapse into one in-flight request.
+- Forced refresh bypasses the cached value and stores the new value.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
+## Thread notification refresh policy
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/thread-refresh-policy.test.mjs`.
+2. Let the test import the notification-refresh helper from `src/composables/threadPerformanceUtils.ts`.
+
+#### Expected Results
+- Item-level notifications such as `item/completed` do not request a sidebar `thread/list` refresh.
+- Structural notifications such as `thread/name/updated` and `turn/completed` still request a sidebar refresh.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
+## Live-state cache policy for large completed sessions
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/live-state-cache-policy.test.mjs`.
+2. Let the test import the live-state cache policy helpers from `src/server/liveStateCachePolicy.ts`.
+
+#### Expected Results
+- Normal completed sessions keep the short base live-state cache TTL.
+- Completed sessions at or above the large-session threshold get a longer cache TTL.
+- Very large completed sessions get the longest cache TTL.
+- In-progress sessions do not use the completed-thread live-state cache.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
+## Temporary Codex account-home cleanup
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/temporary-codex-home-cleanup.test.mjs`.
+2. Let the test import the temporary cleanup helpers from `src/server/temporaryCodexHomeCleanup.ts`.
+
+#### Expected Results
+- Temporary Codex app-server cleanup waits for process exit before removing the temp `CODEX_HOME`.
+- `ENOTEMPTY` cleanup races are retried instead of surfacing immediately as account quota refresh errors.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
 ### Feature: Telegram bot token stored in dedicated global file
 
 #### Prerequisites

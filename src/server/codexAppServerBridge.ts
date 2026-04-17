@@ -12,6 +12,7 @@ import { createInterface } from 'node:readline'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { resolveLiveStateCacheTtlMs } from './liveStateCachePolicy.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
 import { TelegramThreadBridge } from './telegramThreadBridge.js'
@@ -118,7 +119,6 @@ const API_PERF_BODY_MB_THRESHOLD_ENV_KEY = 'CODEXUI_API_PERF_BODY_MB_THRESHOLD'
 const DEFAULT_API_PERF_MS_THRESHOLD = 300
 const DEFAULT_API_PERF_BODY_MB_THRESHOLD = 1
 const MB_DIVISOR = 1024 * 1024
-const LIVE_STATE_CACHE_TTL_MS = 30_000
 const MAX_LIVE_STATE_SESSION_LOG_BYTES = 8 * 1024 * 1024
 const MAX_THREAD_SNAPSHOT_SESSION_BYTES = 8 * 1024 * 1024
 
@@ -2723,10 +2723,11 @@ class AppServerProcess {
     return this.lastThreadReadSnapshotByThreadId.get(threadId) ?? null
   }
 
-  cacheLiveState(threadId: string, data: unknown): void {
+  cacheLiveState(threadId: string, data: unknown, ttlMs: number): void {
+    if (ttlMs <= 0) return
     this.liveStateCache.set(threadId, {
       data,
-      expiresAt: Date.now() + LIVE_STATE_CACHE_TTL_MS,
+      expiresAt: Date.now() + ttlMs,
     })
   }
 
@@ -3817,8 +3818,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
               isInProgress,
             }
 
-            if (!isInProgress) {
-              appServer.cacheLiveState(threadId, responseData)
+            const liveStateCacheTtlMs = resolveLiveStateCacheTtlMs({
+              sessionSizeBytes: sessionSize,
+              isInProgress,
+            })
+
+            if (liveStateCacheTtlMs > 0) {
+              appServer.cacheLiveState(threadId, responseData, liveStateCacheTtlMs)
             }
 
             return responseData
