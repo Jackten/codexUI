@@ -113,6 +113,25 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - No cleanup required.
 
+## Live-state cache policy for large completed sessions
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/live-state-cache-policy.test.mjs`.
+2. Let the test import the live-state cache policy helpers from `src/server/liveStateCachePolicy.ts`.
+
+#### Expected Results
+- Normal completed sessions keep the short base live-state cache TTL.
+- Completed sessions at or above the large-session threshold get a longer cache TTL.
+- Very large completed sessions get the longest cache TTL.
+- In-progress sessions do not use the completed-thread live-state cache.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
 ## Temporary Codex account-home cleanup
 
 #### Prerequisites
