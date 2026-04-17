@@ -13,6 +13,7 @@ import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
 import { resolveLiveStateCacheTtlMs } from './liveStateCachePolicy.js'
+import { LiveStateCacheStore } from './liveStateCacheStore.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
 import { TelegramThreadBridge } from './telegramThreadBridge.js'
@@ -2526,7 +2527,7 @@ class AppServerProcess {
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
-  private readonly liveStateCache = new Map<string, { data: unknown; expiresAt: number }>()
+  private readonly liveStateCache = new LiveStateCacheStore()
   private readonly inFlightLiveStateByThreadId = new Map<string, Promise<unknown>>()
 
 
@@ -2724,21 +2725,11 @@ class AppServerProcess {
   }
 
   cacheLiveState(threadId: string, data: unknown, ttlMs: number): void {
-    if (ttlMs <= 0) return
-    this.liveStateCache.set(threadId, {
-      data,
-      expiresAt: Date.now() + ttlMs,
-    })
+    this.liveStateCache.set(threadId, data, ttlMs)
   }
 
   getCachedLiveState(threadId: string): unknown | null {
-    const cached = this.liveStateCache.get(threadId)
-    if (!cached) return null
-    if (cached.expiresAt <= Date.now()) {
-      this.liveStateCache.delete(threadId)
-      return null
-    }
-    return cached.data
+    return this.liveStateCache.get(threadId)
   }
 
   invalidateLiveStateCache(threadId: string): void {
