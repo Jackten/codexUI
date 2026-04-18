@@ -519,9 +519,25 @@ async function fetchThreadLiveState(threadId: string): Promise<LiveStateResponse
   }
 }
 
+function countTurnItems(turns: unknown[]): { turnCount: number; itemCount: number } {
+  let itemCount = 0
+  for (const turn of turns) {
+    if (turn && typeof turn === 'object' && !Array.isArray(turn)) {
+      const items = (turn as { items?: unknown }).items
+      if (Array.isArray(items)) {
+        itemCount += items.length
+      }
+    }
+  }
+  return {
+    turnCount: turns.length,
+    itemCount,
+  }
+}
+
 function normalizeMessagesFromLiveState(
   liveState: LiveStateResponse,
-): { messages: UiMessage[]; inProgress: boolean; activeTurnId: string; turnIndexByTurnId: ThreadTurnIndexById } | null {
+): { messages: UiMessage[]; inProgress: boolean; activeTurnId: string; turnIndexByTurnId: ThreadTurnIndexById; turnCount: number; itemCount: number } | null {
   const state = liveState.conversationState
   if (!state || !Array.isArray(state.turns) || state.turns.length === 0) return null
 
@@ -533,11 +549,14 @@ function normalizeMessagesFromLiveState(
   }
 
   const messages = normalizeThreadMessagesV2(syntheticPayload)
+  const counts = countTurnItems(state.turns)
   return {
     messages,
     inProgress: liveState.isInProgress,
     activeTurnId: readActiveTurnIdFromResponse(syntheticPayload),
     turnIndexByTurnId: buildTurnIndexByTurnId(syntheticPayload),
+    turnCount: counts.turnCount,
+    itemCount: counts.itemCount,
   }
 }
 
@@ -546,6 +565,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
   inProgress: boolean
   activeTurnId: string
   turnIndexByTurnId: ThreadTurnIndexById
+  turnCount: number
+  itemCount: number
 }> {
   const liveState = await fetchThreadLiveState(threadId)
   if (liveState && !liveState.liveStateError) {
@@ -560,11 +581,15 @@ async function getThreadDetailV2(threadId: string): Promise<{
     includeTurns: true,
   })
   const normalized = normalizeThreadMessagesV2(payload)
+  const turns = Array.isArray(payload.thread?.turns) ? payload.thread.turns : []
+  const counts = countTurnItems(turns)
   return {
     messages: normalized,
     inProgress: readThreadInProgressFromResponse(payload),
     activeTurnId: readActiveTurnIdFromResponse(payload),
     turnIndexByTurnId: buildTurnIndexByTurnId(payload),
+    turnCount: counts.turnCount,
+    itemCount: counts.itemCount,
   }
 }
 
@@ -589,6 +614,8 @@ export async function getThreadDetail(threadId: string): Promise<{
   inProgress: boolean
   activeTurnId: string
   turnIndexByTurnId: ThreadTurnIndexById
+  turnCount: number
+  itemCount: number
 }> {
   try {
     return await getThreadDetailV2(threadId)

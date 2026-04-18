@@ -3,6 +3,21 @@ export type TimedCacheEntry<T> = {
   fetchedAt: number
 }
 
+export type ActiveThreadReloadReason = 'message-body-change' | 'version-change'
+
+export type ActiveThreadReloadDecision = {
+  shouldReload: boolean
+  reasons: ActiveThreadReloadReason[]
+}
+
+export type ActiveThreadReloadOutcomeState = {
+  threadId: string
+  lastLoadedVersion: string
+  sameVersionReloadStreak: number
+}
+
+const SAME_VERSION_RELOAD_WARNING_THRESHOLD = 3
+
 export function isTimestampFresh(fetchedAt: number, nowMs: number, ttlMs: number): boolean {
   return fetchedAt > 0 && nowMs - fetchedAt <= ttlMs
 }
@@ -88,7 +103,27 @@ export function shouldRefreshThreadMessagesForNotificationMethod(method: string)
       method === 'turn/failed'
     )
   }
-  return method.startsWith('thread/')
+  return false
+}
+
+export function describeActiveThreadReloadFromSync(params: {
+  hasMessageBodyChange: boolean
+  hasVersionChange: boolean
+  shouldRefreshThreads: boolean
+}): ActiveThreadReloadDecision {
+  const { hasMessageBodyChange, hasVersionChange, shouldRefreshThreads } = params
+  void shouldRefreshThreads
+  const reasons: ActiveThreadReloadReason[] = []
+  if (hasMessageBodyChange) {
+    reasons.push('message-body-change')
+  }
+  if (hasVersionChange) {
+    reasons.push('version-change')
+  }
+  return {
+    shouldReload: reasons.length > 0,
+    reasons,
+  }
 }
 
 export function shouldReloadActiveThreadFromSync(params: {
@@ -96,8 +131,42 @@ export function shouldReloadActiveThreadFromSync(params: {
   hasVersionChange: boolean
   shouldRefreshThreads: boolean
 }): boolean {
-  const { isActiveDirty, hasVersionChange } = params
-  return isActiveDirty || hasVersionChange
+  return describeActiveThreadReloadFromSync({
+    hasMessageBodyChange: params.isActiveDirty,
+    hasVersionChange: params.hasVersionChange,
+    shouldRefreshThreads: params.shouldRefreshThreads,
+  }).shouldReload
+}
+
+export function noteActiveThreadReloadOutcome(
+  previousState: ActiveThreadReloadOutcomeState | undefined,
+  params: {
+    threadId: string
+    reasons: ActiveThreadReloadReason[]
+    loadedVersionBeforeReload: string
+    loadedVersionAfterReload: string
+  },
+): {
+  state: ActiveThreadReloadOutcomeState
+  shouldWarn: boolean
+} {
+  const { threadId, reasons, loadedVersionBeforeReload, loadedVersionAfterReload } = params
+  const hasVersionChangeReason = reasons.includes('version-change')
+  const versionAdvanced = hasVersionChangeReason && loadedVersionAfterReload.length > 0 && loadedVersionAfterReload !== loadedVersionBeforeReload
+  const sameThread = previousState?.threadId === threadId
+  const sameVersionReloadStreak = versionAdvanced
+    ? 0
+    : sameThread
+      ? previousState.sameVersionReloadStreak + 1
+      : 1
+  return {
+    state: {
+      threadId,
+      lastLoadedVersion: loadedVersionAfterReload || loadedVersionBeforeReload,
+      sameVersionReloadStreak,
+    },
+    shouldWarn: sameVersionReloadStreak >= SAME_VERSION_RELOAD_WARNING_THRESHOLD,
+  }
 }
 
 export function touchThreadAccessOrder(order: string[], threadId: string): string[] {

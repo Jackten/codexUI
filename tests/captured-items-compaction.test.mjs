@@ -39,6 +39,12 @@ test('prunes captured items once they become canonical in later thread reads', (
       ],
     },
   ])
+  assert.deepEqual(firstPass.stats, {
+    capturedItemCount: 2,
+    prunedCount: 1,
+    remainingCount: 1,
+    mapDeleted: false,
+  })
   assert.deepEqual([...firstPass.nextCapturedItemsById.keys()], ['item-2'])
 
   const canonicalTurns = [
@@ -57,6 +63,12 @@ test('prunes captured items once they become canonical in later thread reads', (
   })
 
   assert.deepEqual(secondPass.turns, canonicalTurns)
+  assert.deepEqual(secondPass.stats, {
+    capturedItemCount: 1,
+    prunedCount: 1,
+    remainingCount: 0,
+    mapDeleted: true,
+  })
   assert.equal(secondPass.nextCapturedItemsById.size, 0)
 })
 
@@ -77,5 +89,49 @@ test('keeps captured items for turns that are still absent from the canonical sn
   })
 
   assert.deepEqual(result.turns, turns)
+  assert.deepEqual(result.stats, {
+    capturedItemCount: 1,
+    prunedCount: 0,
+    remainingCount: 1,
+    mapDeleted: false,
+  })
   assert.deepEqual([...result.nextCapturedItemsById.keys()], ['item-2'])
+})
+
+test('drops absent-turn captured items once that turn arrives in the canonical snapshot', () => {
+  const firstPass = mergeCapturedItemsIntoTurns({
+    turns: [
+      {
+        id: 'turn-1',
+        items: [],
+      },
+    ],
+    capturedItemsById: new Map([
+      ['item-2', capturedItem('item-2', 'turn-2', 'fileChange', false)],
+    ]),
+  })
+
+  assert.deepEqual([...firstPass.nextCapturedItemsById.keys()], ['item-2'])
+
+  const secondPass = mergeCapturedItemsIntoTurns({
+    turns: [
+      {
+        id: 'turn-1',
+        items: [],
+      },
+      {
+        id: 'turn-2',
+        items: [{ id: 'item-2', type: 'fileChange' }],
+      },
+    ],
+    capturedItemsById: firstPass.nextCapturedItemsById,
+  })
+
+  assert.deepEqual(secondPass.stats, {
+    capturedItemCount: 1,
+    prunedCount: 1,
+    remainingCount: 0,
+    mapDeleted: true,
+  })
+  assert.equal(secondPass.nextCapturedItemsById.size, 0)
 })

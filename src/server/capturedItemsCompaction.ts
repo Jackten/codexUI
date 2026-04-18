@@ -12,21 +12,36 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+export type CapturedItemCompactionStats = {
+  capturedItemCount: number
+  prunedCount: number
+  remainingCount: number
+  mapDeleted: boolean
+}
+
 export function mergeCapturedItemsIntoTurns(params: {
   turns: unknown[]
   capturedItemsById: Map<string, CapturedItem>
 }): {
   turns: unknown[]
   nextCapturedItemsById: Map<string, CapturedItem>
+  stats: CapturedItemCompactionStats
 } {
   const { turns, capturedItemsById } = params
   if (capturedItemsById.size === 0) {
     return {
       turns,
       nextCapturedItemsById: new Map(),
+      stats: {
+        capturedItemCount: 0,
+        prunedCount: 0,
+        remainingCount: 0,
+        mapDeleted: true,
+      },
     }
   }
 
+  const capturedItemCount = capturedItemsById.size
   const remainingCapturedItemsById = new Map(capturedItemsById)
   const itemsByTurnId = new Map<string, CapturedItem[]>()
   for (const captured of capturedItemsById.values()) {
@@ -71,5 +86,11 @@ export function mergeCapturedItemsIntoTurns(params: {
   return {
     turns: mergedTurns,
     nextCapturedItemsById: remainingCapturedItemsById,
+    stats: {
+      capturedItemCount,
+      prunedCount: capturedItemCount - remainingCapturedItemsById.size,
+      remainingCount: remainingCapturedItemsById.size,
+      mapDeleted: remainingCapturedItemsById.size === 0,
+    },
   }
 }

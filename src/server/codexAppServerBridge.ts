@@ -399,6 +399,10 @@ function logProviderModelDiscoveryWarning(message: string, details: Record<strin
   console.warn('[codex-provider-models]', message, details)
 }
 
+function logCapturedItemCompaction(message: string, details: Record<string, unknown>): void {
+  console.debug('[codex-live-state]', message, details)
+}
+
 function isTimeoutError(payload: unknown): boolean {
   return payload instanceof Error && (payload.name === 'AbortError' || payload.name === 'TimeoutError')
 }
@@ -2428,6 +2432,14 @@ class AppServerProcess {
     } else {
       this.capturedItemsByThreadId.set(threadId, result.nextCapturedItemsById)
     }
+
+    logCapturedItemCompaction('captured-item-compaction', {
+      threadId,
+      capturedItemCount: result.stats.capturedItemCount,
+      prunedCount: result.stats.prunedCount,
+      remainingCount: result.stats.remainingCount,
+      mapDeleted: result.stats.mapDeleted,
+    })
 
     return result.turns
   }

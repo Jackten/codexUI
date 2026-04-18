@@ -56,7 +56,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, shouldReloadActiveThreadFromSync, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrRefreshTimedCacheValue, getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, touchThreadAccessOrder, type ActiveThreadReloadDecision, type ActiveThreadReloadOutcomeState, type ActiveThreadReloadReason, type TimedCacheEntry, describeActiveThreadReloadFromSync, noteActiveThreadReloadOutcome } from './threadPerformanceUtils'
 import { SKILLS_CACHE_TTL_MS, THREAD_TITLE_CACHE_TTL_MS } from './metadataCachePolicy'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
@@ -83,6 +83,13 @@ const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.2-codex'
+const ACTIVE_THREAD_RELOAD_LOG_PREFIX = '[codex-thread-reload]'
+
+type LoadMessagesInstrumentation = {
+  reloadDecision?: ActiveThreadReloadDecision
+  loadedVersionBeforeReload?: string
+  currentVersionBeforeReload?: string
+}
 
 function loadReadStateMap(): Record<string, string> {
   if (typeof window === 'undefined') return {}
@@ -1060,6 +1067,11 @@ export function useDesktopState() {
   const inFlightWorkspaceRootsStateByKey = new Map<string, Promise<WorkspaceRootsState>>()
   let lastThreadTitleCacheLoadAt = 0
   let loadedThreadAccessOrder: string[] = []
+  let lastActiveThreadReloadOutcome: ActiveThreadReloadOutcomeState | undefined
+  const activeThreadReloadAttemptsByReason: Record<ActiveThreadReloadReason, number> = {
+    'message-body-change': 0,
+    'version-change': 0,
+  }
 
 
   const allThreads = computed(() => flattenThreads(projectGroups.value))
@@ -1846,6 +1858,63 @@ export function useDesktopState() {
   function currentThreadVersion(threadId: string): string {
     const thread = flattenThreads(sourceGroups.value).find((row) => row.id === threadId)
     return thread?.updatedAtIso ?? ''
+  }
+
+  function logActiveThreadReloadAttempt(threadId: string, decision: ActiveThreadReloadDecision, params: {
+    loadedVersion: string
+    currentVersion: string
+  }): void {
+    for (const reason of decision.reasons) {
+      activeThreadReloadAttemptsByReason[reason] += 1
+    }
+    console.debug(ACTIVE_THREAD_RELOAD_LOG_PREFIX, 'attempt', {
+      threadId,
+      reasons: decision.reasons,
+      attemptCounts: { ...activeThreadReloadAttemptsByReason },
+      loadedVersion: params.loadedVersion,
+      currentVersion: params.currentVersion,
+    })
+  }
+
+  function logActiveThreadReloadResult(threadId: string, decision: ActiveThreadReloadDecision, params: {
+    startedAtMs: number
+    loadedVersionBeforeReload: string
+    currentVersionBeforeReload: string
+    loadedVersionAfterReload: string
+    turnCount: number
+    itemCount: number
+    messageCount: number
+  }): void {
+    const durationMs = Date.now() - params.startedAtMs
+    console.debug(ACTIVE_THREAD_RELOAD_LOG_PREFIX, 'result', {
+      threadId,
+      reasons: decision.reasons,
+      durationMs,
+      loadedVersionBeforeReload: params.loadedVersionBeforeReload,
+      currentVersionBeforeReload: params.currentVersionBeforeReload,
+      loadedVersionAfterReload: params.loadedVersionAfterReload,
+      turnCount: params.turnCount,
+      itemCount: params.itemCount,
+      messageCount: params.messageCount,
+    })
+
+    const nextOutcome = noteActiveThreadReloadOutcome(lastActiveThreadReloadOutcome, {
+      threadId,
+      reasons: decision.reasons,
+      loadedVersionBeforeReload: params.loadedVersionBeforeReload,
+      loadedVersionAfterReload: params.loadedVersionAfterReload,
+    })
+    lastActiveThreadReloadOutcome = nextOutcome.state
+    if (nextOutcome.shouldWarn) {
+      console.warn(ACTIVE_THREAD_RELOAD_LOG_PREFIX, 'repeated-same-version-reload', {
+        threadId,
+        reasons: decision.reasons,
+        sameVersionReloadStreak: nextOutcome.state.sameVersionReloadStreak,
+        loadedVersionBeforeReload: params.loadedVersionBeforeReload,
+        currentVersionBeforeReload: params.currentVersionBeforeReload,
+        loadedVersionAfterReload: params.loadedVersionAfterReload,
+      })
+    }
   }
 
   function setThreadScrollState(threadId: string, nextState: ThreadScrollState): void {
@@ -3479,7 +3548,10 @@ export function useDesktopState() {
     })
   }
 
-  async function loadMessages(threadId: string, options: { silent?: boolean } = {}) {
+  async function loadMessages(
+    threadId: string,
+    options: { silent?: boolean; instrumentation?: LoadMessagesInstrumentation } = {},
+  ) {
     if (!threadId) {
       return
     }
@@ -3498,6 +3570,8 @@ export function useDesktopState() {
 
     const loadPromise = (async () => {
       try {
+        const instrumentation = options.instrumentation
+        const startedAtMs = instrumentation?.reloadDecision ? Date.now() : 0
         const needsResume = resumedThreadById.value[threadId] !== true
         const resumePromise = needsResume
           ? resumeThread(threadId)
@@ -3514,7 +3588,7 @@ export function useDesktopState() {
           : null
         const detail = await getThreadDetail(threadId)
 
-        const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+        const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId, turnCount, itemCount } = detail
         markThreadMessagesPersisted(threadId, nextMessages)
         replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
         rebindLiveFileChangeTurnIndices(threadId)
@@ -3557,6 +3631,18 @@ export function useDesktopState() {
           clearCompletedTurnLiveState(threadId)
         }
         markThreadAsRead(threadId)
+
+        if (instrumentation?.reloadDecision) {
+          logActiveThreadReloadResult(threadId, instrumentation.reloadDecision, {
+            startedAtMs,
+            loadedVersionBeforeReload: instrumentation.loadedVersionBeforeReload ?? '',
+            currentVersionBeforeReload: instrumentation.currentVersionBeforeReload ?? '',
+            loadedVersionAfterReload: loadedVersionByThreadId.value[threadId] ?? '',
+            turnCount,
+            itemCount,
+            messageCount: nextMessages.length,
+          })
+        }
 
         if (resumePromise) {
           void resumePromise
@@ -4482,18 +4568,29 @@ export function useDesktopState() {
       const activeThreadId = selectedThreadId.value
       if (!activeThreadId) return
 
-      const isActiveDirty = threadIdsToRefresh.has(activeThreadId)
+      const hasActiveThreadMessageBodyChange = threadIdsToRefresh.has(activeThreadId)
       const currentVersion = currentThreadVersion(activeThreadId)
       const loadedVersion = loadedVersionByThreadId.value[activeThreadId] ?? ''
       const hasVersionChange = currentVersion.length > 0 && currentVersion !== loadedVersion
-      const shouldReloadActiveThread = shouldReloadActiveThreadFromSync({
-        isActiveDirty,
+      const reloadDecision = describeActiveThreadReloadFromSync({
+        hasMessageBodyChange: hasActiveThreadMessageBodyChange,
         hasVersionChange,
         shouldRefreshThreads,
       })
 
-      if (shouldReloadActiveThread) {
-        await loadMessages(activeThreadId, { silent: true })
+      if (reloadDecision.shouldReload) {
+        logActiveThreadReloadAttempt(activeThreadId, reloadDecision, {
+          loadedVersion,
+          currentVersion,
+        })
+        await loadMessages(activeThreadId, {
+          silent: true,
+          instrumentation: {
+            reloadDecision,
+            loadedVersionBeforeReload: loadedVersion,
+            currentVersionBeforeReload: currentVersion,
+          },
+        })
       }
     } catch {
       // Keep UI stable on transient event sync failures.
@@ -4573,6 +4670,9 @@ export function useDesktopState() {
     pendingThreadsRefresh = false
     pendingThreadMessageRefresh.clear()
     pendingTurnStartsById.clear()
+    lastActiveThreadReloadOutcome = undefined
+    activeThreadReloadAttemptsByReason['message-body-change'] = 0
+    activeThreadReloadAttemptsByReason['version-change'] = 0
     if (eventSyncTimer !== null && typeof window !== 'undefined') {
       window.clearTimeout(eventSyncTimer)
       eventSyncTimer = null
