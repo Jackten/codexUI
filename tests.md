@@ -117,6 +117,25 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - No cleanup required.
 
+## Command execution output budgeting
+
+#### Prerequisites
+- Run from the repo root.
+- Node 22+ is available.
+
+#### Steps
+1. Run `node --test --experimental-strip-types tests/command-output-budget.test.mjs`.
+2. Let the test import the command output budgeting helper from `src/server/commandOutputBudget.ts`.
+3. Optionally open a thread that runs a very noisy command or Oracle/browser-heavy tool sequence and refresh the thread view after the service is rebuilt.
+
+#### Expected Results
+- Short `commandExecution.aggregatedOutput` payloads remain unchanged.
+- Oversized `commandExecution.aggregatedOutput` payloads are truncated with a visible marker instead of keeping multi-megabyte strings inline.
+- Nested turn/item payloads get the same budgeting behavior, so live-state responses stay bounded even when commands produce huge logs.
+
+#### Rollback/Cleanup
+- No cleanup required.
+
 ## Live-state cache policy for large completed sessions
 
 #### Prerequisites

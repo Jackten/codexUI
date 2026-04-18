@@ -12,6 +12,7 @@ import { createInterface } from 'node:readline'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { sanitizeCommandExecutionOutputs } from './commandOutputBudget.js'
 import { resolveLiveStateCacheTtlMs } from './liveStateCachePolicy.js'
 import { LiveStateCacheStore } from './liveStateCacheStore.js'
 import { handleReviewRoutes } from './reviewGit.js'
@@ -438,12 +439,13 @@ async function sanitizeThreadTurnsInlinePayloads(method: string, result: unknown
         nextItems.push(item)
         continue
       }
-      const sanitizedItem = await sanitizeInlinePayloadDeep(item, {
+      const sanitizedByBudget = sanitizeCommandExecutionOutputs(item)
+      const sanitizedItem = await sanitizeInlinePayloadDeep(sanitizedByBudget.value, {
         turnId,
         itemId,
         blockIndex: itemIndex + turnIndex,
       })
-      if (!sanitizedItem.changed) {
+      if (!sanitizedByBudget.changed && !sanitizedItem.changed) {
         nextItems.push(item)
         continue
       }
@@ -2764,6 +2766,10 @@ class AppServerProcess {
     const itemId = typeof item.id === 'string' ? item.id : ''
     if (!itemId) return
 
+    const boundedItem = sanitizeCommandExecutionOutputs(item)
+    const itemData = asRecord(boundedItem.value)
+    if (!itemData) return
+
     const threadId = this.extractThreadIdFromParams(params)
     if (!threadId) return
 
@@ -2787,7 +2793,7 @@ class AppServerProcess {
       id: itemId,
       type: itemType,
       turnId,
-      data: item as Record<string, unknown>,
+      data: itemData,
       completed: isCompleted,
     })
   }
