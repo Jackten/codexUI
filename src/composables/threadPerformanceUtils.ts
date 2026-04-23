@@ -38,6 +38,35 @@ export function getOrStartInFlightRequest<T>(
   return request
 }
 
+export function shouldRefreshThreadListForNotificationMethod(method: string): boolean {
+  if (!method || method === 'thread/tokenUsage/updated') return false
+  if (method.startsWith('item/')) return false
+  if (method.startsWith('turn/')) {
+    return (
+      method === 'turn/started' ||
+      method === 'turn/completed' ||
+      method === 'turn/cancelled' ||
+      method === 'turn/interrupted' ||
+      method === 'turn/failed'
+    )
+  }
+  return method.startsWith('thread/')
+}
+
+export function shouldRefreshThreadMessagesForNotificationMethod(method: string): boolean {
+  if (!method || method === 'thread/tokenUsage/updated') return false
+  if (method.startsWith('item/')) return false
+  if (method.startsWith('turn/')) {
+    return (
+      method === 'turn/completed' ||
+      method === 'turn/cancelled' ||
+      method === 'turn/interrupted' ||
+      method === 'turn/failed'
+    )
+  }
+  return method.startsWith('thread/')
+}
+
 export function touchThreadAccessOrder(order: string[], threadId: string): string[] {
   const normalizedThreadId = threadId.trim()
   if (!normalizedThreadId) return order

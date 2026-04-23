@@ -76,6 +76,11 @@ type WorkspaceRootsState = {
   active: string[]
 }
 
+type RpcCacheEntry = {
+  value: unknown
+  fetchedAt: number
+}
+
 type PendingServerRequest = {
   id: number
   method: string
@@ -2531,6 +2536,8 @@ class AppServerProcess {
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
   private readonly liveStateCache = new LiveStateCacheStore()
   private readonly inFlightLiveStateByThreadId = new Map<string, Promise<unknown>>()
+  private readonly threadListCacheByKey = new Map<string, RpcCacheEntry>()
+  private readonly inFlightThreadListByKey = new Map<string, Promise<unknown>>()
 
 
   private getCodexCommand(): string {
@@ -2910,6 +2917,53 @@ class AppServerProcess {
     })
   }
 
+  private getThreadListCacheKey(params: unknown): string {
+    try {
+      return JSON.stringify(params ?? null)
+    } catch {
+      return String(params)
+    }
+  }
+
+  private rememberThreadListCache(key: string, value: unknown): void {
+    this.threadListCacheByKey.set(key, {
+      value,
+      fetchedAt: Date.now(),
+    })
+
+    while (this.threadListCacheByKey.size > THREAD_LIST_RPC_CACHE_MAX_ENTRIES) {
+      const oldestKey = this.threadListCacheByKey.keys().next().value
+      if (typeof oldestKey !== 'string') break
+      this.threadListCacheByKey.delete(oldestKey)
+    }
+  }
+
+  private async callCachedThreadList(params: unknown): Promise<unknown> {
+    const key = this.getThreadListCacheKey(params)
+    const cached = this.threadListCacheByKey.get(key)
+    if (cached && Date.now() - cached.fetchedAt <= THREAD_LIST_RPC_CACHE_TTL_MS) {
+      return cached.value
+    }
+
+    const inFlight = this.inFlightThreadListByKey.get(key)
+    if (inFlight) {
+      return inFlight
+    }
+
+    const request = this.call('thread/list', params)
+      .then((value) => {
+        this.rememberThreadListCache(key, value)
+        return value
+      })
+      .finally(() => {
+        if (this.inFlightThreadListByKey.get(key) === request) {
+          this.inFlightThreadListByKey.delete(key)
+        }
+      })
+    this.inFlightThreadListByKey.set(key, request)
+    return request
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) return
     if (this.initializePromise) {
@@ -2940,6 +2994,9 @@ class AppServerProcess {
 
   async rpc(method: string, params: unknown): Promise<unknown> {
     await this.ensureInitialized()
+    if (method === 'thread/list') {
+      return this.callCachedThreadList(params)
+    }
     return this.call(method, params)
   }
 
@@ -3156,6 +3213,8 @@ type SharedBridgeState = {
 
 const SHARED_BRIDGE_KEY = '__codexRemoteSharedBridge__'
 const SHARED_BRIDGE_VERSION = 'experimental-api-v2'
+const THREAD_LIST_RPC_CACHE_TTL_MS = 60_000
+const THREAD_LIST_RPC_CACHE_MAX_ENTRIES = 12
 
 function getSharedBridgeState(): SharedBridgeState {
   const globalScope = globalThis as typeof globalThis & {

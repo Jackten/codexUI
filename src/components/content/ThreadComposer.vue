@@ -600,7 +600,11 @@ const standaloneFileAttachments = computed(() => {
   return fileAttachments.value.filter((att) => !grouped.has(att.fsPath))
 })
 const isInteractionDisabled = computed(() => props.disabled || !props.activeThreadId)
-const isFastModeSupported = computed(() => props.selectedModel.trim() === 'gpt-5.4')
+function isFastModeSupportedModel(modelId: string): boolean {
+  return modelId.trim() === 'gpt-5.4' || modelId.trim() === 'gpt-5.5'
+}
+
+const isFastModeSupported = computed(() => isFastModeSupportedModel(props.selectedModel))
 const showFastModeModelIcon = computed(() =>
   props.selectedSpeedMode === 'fast' && isFastModeSupported.value,
 )

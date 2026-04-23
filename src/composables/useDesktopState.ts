@@ -57,7 +57,7 @@ import type {
   UiThread,
 } from '../types/codex'
 import { normalizePathForUi, toProjectName } from '../pathUtils.js'
-import { getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
+import { getOrStartInFlightRequest, isTimestampFresh, readTimedCacheValue, selectThreadsToEvict, shouldRefreshThreadListForNotificationMethod, shouldRefreshThreadMessagesForNotificationMethod, touchThreadAccessOrder, type TimedCacheEntry } from './threadPerformanceUtils'
 
 function flattenThreads(groups: UiProjectGroup[]): UiThread[] {
   return groups.flatMap((group) => group.threads)
@@ -80,8 +80,8 @@ const EVENT_SYNC_DEBOUNCE_MS = 220
 const RATE_LIMIT_REFRESH_DEBOUNCE_MS = 500
 const TURN_START_FOLLOW_UP_SYNC_DELAY_MS = 3000
 const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
-const THREAD_GROUPS_CACHE_TTL_MS = 1_500
-const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 1_000
+const THREAD_GROUPS_CACHE_TTL_MS = 30_000
+const RATE_LIMITS_RESPONSE_CACHE_TTL_MS = 60_000
 const SKILLS_CACHE_TTL_MS = 15_000
 const MAX_LOADED_THREAD_STATES = 4
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
@@ -3559,19 +3559,15 @@ export function useDesktopState() {
   }
 
   function queueEventDrivenSync(notification: RpcNotification): void {
-    if (notification.method === 'thread/tokenUsage/updated') return
+    const method = notification.method
+    if (!shouldRefreshThreadListForNotificationMethod(method) && !shouldRefreshThreadMessagesForNotificationMethod(method)) return
 
     const threadId = extractThreadIdFromNotification(notification)
-    if (threadId) {
+    if (threadId && shouldRefreshThreadMessagesForNotificationMethod(method)) {
       pendingThreadMessageRefresh.add(threadId)
     }
 
-    const method = notification.method
-    if (
-      method.startsWith('thread/') ||
-      method.startsWith('turn/') ||
-      method.startsWith('item/')
-    ) {
+    if (shouldRefreshThreadListForNotificationMethod(method)) {
       pendingThreadsRefresh = true
     }
 
@@ -3787,9 +3783,9 @@ export function useDesktopState() {
           setSelectedThreadId(flatThreads[0]?.id ?? '')
         }
 
-        if (!hasLoadedAllThreadPages) {
-          void loadRemainingThreadPages(rootsState)
-        }
+        // Avoid draining the full historical thread list in the background.
+        // On this host, later pages can block the Codex app-server queue for
+        // many seconds even though the first page is enough for normal use.
       } finally {
         isLoadingThreads.value = false
       }

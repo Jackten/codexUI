@@ -282,8 +282,13 @@ function sortAccounts(accounts: StoredAccountEntry[], activeAccountId: string | 
 }
 
 function toPublicAccountEntry(entry: StoredAccountEntry, activeAccountId: string | null): StoredAccountEntry & { isActive: boolean } {
+  const quotaStatus: AccountQuotaStatus = entry.quotaStatus === 'loading' && entry.quotaSnapshot
+    ? 'ready'
+    : entry.quotaStatus
+
   return {
     ...entry,
+    quotaStatus,
     isActive: entry.accountId === activeAccountId,
   }
 }
